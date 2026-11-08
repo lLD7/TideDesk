@@ -2,64 +2,74 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
+
+	"gammagrid.local/desktop/internal/marketclock"
+	"gammagrid.local/desktop/internal/store"
+	"gammagrid.local/desktop/internal/viewmodel"
 )
 
-func (s *DesktopService) chain(ctx context.Context, q url.Values) (*ChainResponse, error) {
-	ticker, e := normalizeSymbol(q.Get("ticker"))
+type chainQuery struct {
+	Expiries, Side string
+	Band           float64
+	MinOI, Page    int
+}
+
+type chainExpiries struct {
+	options []viewmodel.ExpiryOption
+	total   int
+}
+
+func (s *DesktopService) Chain(ctx context.Context, ticker string, q chainQuery) (*viewmodel.ChainResponse, error) {
+	m, e := s.meta(ctx, ticker)
 	if e != nil {
 		return nil, e
 	}
-	m, e := s.store.meta(ctx, ticker)
-	if e != nil {
-		return nil, e
-	}
-	out := &ChainResponse{Ticker: ticker, Spot: m.Spot, Empty: m.At == "", Expiries: []ExpiryOption{}, Pinned: []PinnedItem{}, Rows: []ChainRow{}, PageSize: 200}
+	ticker = m.Ticker
+	out := &viewmodel.ChainResponse{Ticker: ticker, Spot: m.Spot, Empty: m.At == "", Expiries: []viewmodel.ExpiryOption{}, Pinned: []viewmodel.PinnedItem{}, Rows: []viewmodel.ChainRow{}, PageSize: 200}
 	if out.Empty {
 		return out, nil
 	}
 	// Preserve the numerical module's expiry boundary: 16:00 America/New_York.
-	now := s.now().In(marketZone)
+	now := s.now().In(marketclock.Zone)
 	day := now.Format("2006-01-02")
 	includeToday := now.Hour() < 16
 	base := `ticker=? AND source=? AND collected_at=? AND (expiry>? OR (expiry=? AND ?))`
 	args := []any{ticker, m.Source, m.At, day, day, includeToday}
-	union := "SELECT " + snapshotSelectCols + " FROM option_snapshots WHERE " + base + " UNION ALL SELECT " + snapshotSelectCols + " FROM option_snapshots_archive WHERE " + base
+	union := "SELECT " + store.SnapshotColumns + " FROM option_snapshots WHERE " + base + " UNION ALL SELECT " + store.SnapshotColumns + " FROM option_snapshots_archive WHERE " + base
 	bothArgs := append(append([]any{}, args...), args...)
-	expRows, e := s.store.read.QueryContext(ctx, "SELECT substr(expiry,1,10),count(*) FROM ("+union+") GROUP BY substr(expiry,1,10) ORDER BY substr(expiry,1,10)", bothArgs...)
+	key := fmt.Sprintf("chain/%s/%s/%s/%s/%t", ticker, m.Source, m.At, day, includeToday)
+	expiries, e := cached(s.cache, ctx, key+"/expiries", func(task context.Context) (chainExpiries, error) {
+		rows, err := s.store.Read().QueryContext(task, "SELECT substr(expiry,1,10),count(*) FROM ("+union+") GROUP BY substr(expiry,1,10) ORDER BY substr(expiry,1,10)", bothArgs...)
+		if err != nil {
+			return chainExpiries{}, err
+		}
+		defer rows.Close()
+		result := chainExpiries{}
+		for rows.Next() {
+			var exp string
+			var count int
+			if err := rows.Scan(&exp, &count); err != nil {
+				return chainExpiries{}, err
+			}
+			t, err := time.Parse("2006-01-02", exp)
+			if err != nil {
+				return chainExpiries{}, err
+			}
+			result.options = append(result.options, viewmodel.ExpiryOption{ISO: exp, Label: t.Format("01-02") + " " + viewmodel.WeekdaysCN[t.Weekday()]})
+			result.total += count
+		}
+		return result, rows.Err()
+	})
 	if e != nil {
 		return nil, e
 	}
-	valid := map[string]bool{}
-	for expRows.Next() {
-		var exp string
-		var n int
-		if e = expRows.Scan(&exp, &n); e != nil {
-			expRows.Close()
-			return nil, e
-		}
-		valid[exp] = true
-		t, e := time.Parse("2006-01-02", exp)
-		if e != nil {
-			expRows.Close()
-			return nil, e
-		}
-		out.Expiries = append(out.Expiries, ExpiryOption{ISO: exp, Label: t.Format("01-02") + " " + weekdaysCNByGoWeekday[t.Weekday()]})
-		out.TotalChain += n
-	}
-	e = expRows.Err()
-	expRows.Close()
-	if e != nil {
-		return nil, e
-	}
+	out.Expiries, out.TotalChain = expiries.options, expiries.total
 	selected := []string{}
-	raw := q.Get("expiries")
+	raw := q.Expiries
 	if raw == "" {
 		for _, exp := range out.Expiries[:min(2, len(out.Expiries))] {
 			selected = append(selected, exp.ISO)
@@ -70,8 +80,11 @@ func (s *DesktopService) chain(ctx context.Context, q url.Values) (*ChainRespons
 			if _, e = time.Parse("2006-01-02", exp); e != nil {
 				return nil, fmt.Errorf("无效到期日")
 			}
-			if valid[exp] {
-				selected = append(selected, exp)
+			for _, option := range expiries.options {
+				if exp == option.ISO {
+					selected = append(selected, exp)
+					break
+				}
 			}
 		}
 	}
@@ -83,68 +96,58 @@ func (s *DesktopService) chain(ctx context.Context, q url.Values) (*ChainRespons
 			filterArgs = append(filterArgs, exp)
 		}
 	}
-	side := q.Get("side")
+	side := q.Side
 	if side == "call" || side == "put" {
 		where += " AND option_type=?"
 		filterArgs = append(filterArgs, side)
 	}
-	band := 10.0
-	if v, e := strconv.ParseFloat(q.Get("band"), 64); e == nil {
-		band = max(0, min(100, v))
-	}
+	band := max(0, min(100, q.Band))
 	if band > 0 {
 		where += " AND strike BETWEEN ? AND ?"
 		filterArgs = append(filterArgs, m.Spot*(1-band/100), m.Spot*(1+band/100))
 	}
-	minOI := intQuery(q, "min_oi", 0, 0, 1000000000)
+	minOI := max(0, min(q.MinOI, 1000000000))
 	if minOI > 0 {
 		where += " AND COALESCE(open_interest,0)>=?"
 		filterArgs = append(filterArgs, minOI)
 	}
 	allArgs := append(append([]any{}, bothArgs...), filterArgs...)
-	e = s.store.read.QueryRowContext(ctx, "SELECT count(*) FROM ("+union+") WHERE "+where, allArgs...).Scan(&out.TotalMatching)
-	if e != nil {
-		return nil, e
-	}
-	out.PageSize = intQuery(q, "page_size", 200, 1, 400)
-	out.Page = intQuery(q, "page", 0, 0, 100000)
-	out.Page = min(out.Page, max(0, (out.TotalMatching-1)/out.PageSize))
-	query := "SELECT * FROM (" + union + ") WHERE " + where + " ORDER BY substr(expiry,1,10),strike,option_type LIMIT ? OFFSET ?"
-	allArgs = append(allArgs, out.PageSize, out.Page*out.PageSize)
-	key := fmt.Sprintf("chain/%d/%s/%s/%s/%s/%t/%s", s.store.revision.Load(), ticker, m.Source, m.At, day, includeToday, q.Encode())
-	b, e := s.cache.Do(ctx, key, func(task context.Context) ([]byte, error) {
-		sqlRows, err := s.store.read.QueryContext(task, query, allArgs...)
-		if err != nil {
-			return nil, err
-		}
-		defer sqlRows.Close()
-		storedRows, err := scanStoredOptionRows(sqlRows)
-		if err != nil {
-			return nil, err
-		}
-		if len(storedRows) == 0 {
-			return []byte(`{"rows":[]}`), nil
-		}
-		chainRows := buildChainRowsGo(storedRows, m.Spot)
-		return json.Marshal(map[string]any{"rows": chainRows})
+	filterKey := fmt.Sprintf("%s/filter/%s/%s/%g/%d", key, strings.Join(selected, ","), side, band, minOI)
+	out.TotalMatching, e = cached(s.cache, ctx, filterKey, func(task context.Context) (int, error) {
+		var count int
+		err := s.store.Read().QueryRowContext(task, "SELECT count(*) FROM ("+union+") WHERE "+where, allArgs...).Scan(&count)
+		return count, err
 	})
 	if e != nil {
 		return nil, e
 	}
-	var result struct {
-		Rows []ChainRow `json:"rows"`
-	}
-	if e = json.Unmarshal(b, &result); e != nil {
+	out.Page = max(0, min(q.Page, (out.TotalMatching-1)/out.PageSize))
+	query := "SELECT * FROM (" + union + ") WHERE " + where + " ORDER BY substr(expiry,1,10),strike,option_type LIMIT ? OFFSET ?"
+	allArgs = append(allArgs, out.PageSize, out.Page*out.PageSize)
+	pageKey := fmt.Sprintf("%s/page/%d", filterKey, out.Page)
+	page, e := buildView(s, ctx, pageKey, func(task context.Context) ([]viewmodel.ChainRow, error) {
+		sqlRows, err := s.store.Read().QueryContext(task, query, allArgs...)
+		if err != nil {
+			return nil, err
+		}
+		defer sqlRows.Close()
+		storedRows, err := store.ScanSnapshots(sqlRows)
+		if err != nil || len(storedRows) == 0 {
+			return nil, err
+		}
+		return buildChainRowsGo(storedRows, m.Spot), nil
+	})
+	if e != nil {
 		return nil, e
 	}
-	out.Rows = result.Rows
-	pins, e := s.store.read.QueryContext(ctx, "SELECT id,CAST(expiry AS TEXT),strike,option_type FROM tracked_contracts WHERE ticker=? ORDER BY expiry,strike", ticker)
+	out.Rows = *page
+	pins, e := s.store.Read().QueryContext(ctx, "SELECT id,CAST(expiry AS TEXT),strike,option_type FROM tracked_contracts WHERE ticker=? ORDER BY expiry,strike", ticker)
 	if e != nil {
 		return nil, e
 	}
 	defer pins.Close()
 	for pins.Next() {
-		var p PinnedItem
+		var p viewmodel.PinnedItem
 		if e = pins.Scan(&p.ID, &p.ExpiryISO, &p.Strike, &p.Type); e != nil {
 			return nil, e
 		}
@@ -155,8 +158,8 @@ func (s *DesktopService) chain(ctx context.Context, q url.Values) (*ChainRespons
 }
 
 func calcScreenerDTE(expiryISO, momentStr string) int {
-	tExp, ok1 := parseAnyTime(expiryISO)
-	tRef, ok2 := parseAnyTime(momentStr)
+	tExp, ok1 := marketclock.ParseTime(expiryISO)
+	tRef, ok2 := marketclock.ParseTime(momentStr)
 	if !ok1 || !ok2 {
 		return 0
 	}
@@ -164,10 +167,10 @@ func calcScreenerDTE(expiryISO, momentStr string) int {
 	return int(math.Floor(tExpDay.Sub(tRef.UTC()).Seconds() / 86400.0))
 }
 
-func buildChainRowsGo(rows []StoredOptionRow, spot float64) []ChainRow {
+func buildChainRowsGo(rows []store.StoredOptionRow, spot float64) []viewmodel.ChainRow {
 	enrichGreeks(rows, defaultRiskFreeRate, 0.0)
 	moment := rows[0].CollectedAt
-	out := make([]ChainRow, len(rows))
+	out := make([]viewmodel.ChainRow, len(rows))
 	for i := range rows {
 		r := &rows[i]
 		expISO := r.Expiry
@@ -209,21 +212,21 @@ func buildChainRowsGo(rows []StoredOptionRow, spot float64) []ChainRow {
 		if isValidFinite(r.Charm) {
 			charmStr = fmt.Sprintf("%+.4f", *r.Charm)
 		}
-		out[i] = ChainRow{
+		out[i] = viewmodel.ChainRow{
 			ExpiryISO: expISO,
-			Expiry:    fmtExpiryShort(expISO),
+			Expiry:    viewmodel.FmtExpiryShort(expISO),
 			DTE:       calcScreenerDTE(expISO, moment),
 			Strike:    k,
-			StrikeStr: fmtStrikeVal(k),
+			StrikeStr: viewmodel.FmtStrikeVal(k),
 			Type:      otype,
 			TypeShort: typeShort,
 			Moneyness: moneyness,
-			Bid:       fmtPrice(r.Bid, 2),
-			Ask:       fmtPrice(r.Ask, 2),
-			Last:      fmtPrice(r.LastPrice, 2),
+			Bid:       viewmodel.FmtPrice(r.Bid, 2),
+			Ask:       viewmodel.FmtPrice(r.Ask, 2),
+			Last:      viewmodel.FmtPrice(r.LastPrice, 2),
 			Volume:    volStr,
 			OI:        oiStr,
-			IV:        fmtPct(r.IV, 1, false),
+			IV:        viewmodel.FmtPct(r.IV, 1, false),
 			Delta:     deltaStr,
 			Gamma:     gammaStr,
 			Theta:     thetaStr,

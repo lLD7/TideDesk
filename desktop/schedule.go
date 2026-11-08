@@ -4,215 +4,272 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
+
+	"gammagrid.local/desktop/internal/marketclock"
+	"gammagrid.local/desktop/internal/provider"
+	"gammagrid.local/desktop/internal/store"
 )
 
-var marketZone = func() *time.Location {
-	loc, err := time.LoadLocation("America/New_York")
-	if err != nil {
-		panic(err)
-	}
-	return loc
-}()
-
-type ScheduleConfig struct {
-	Mode    string   `json:"mode"`
-	Times   []string `json:"times"`
-	Minutes int      `json:"minutes"`
-	Until   string   `json:"until"`
-}
-
-func defaultSchedule() ScheduleConfig {
-	return ScheduleConfig{Mode: "fixed", Times: []string{"10:00", "12:00", "14:00", "16:15"}, Minutes: 15}
-}
-func (cfg ScheduleConfig) effective(now time.Time) ScheduleConfig {
-	if cfg.Mode == "temporary" {
-		until, e := time.Parse(time.RFC3339, cfg.Until)
-		if e != nil || !now.Before(until) {
-			cfg.Mode = "fixed"
-			cfg.Until = ""
-		}
-	}
-	return cfg
-}
-func validateSchedule(cfg ScheduleConfig, now time.Time) error {
-	if cfg.Mode != "fixed" && cfg.Mode != "manual" && cfg.Mode != "temporary" && cfg.Mode != "interval" {
-		return fmt.Errorf("请选择固定时点、定频采集、仅手动或临时频率")
-	}
-	if len(cfg.Times) < 1 || len(cfg.Times) > 12 {
-		return fmt.Errorf("请输入 1–12 个美东采集时点")
-	}
-	seen := map[string]bool{}
-	for _, v := range cfg.Times {
-		t, e := time.Parse("15:04", v)
-		if e != nil || t.Format("15:04") != v || seen[v] {
-			return fmt.Errorf("时点须为不重复的 HH:MM，例如 10:00")
-		}
-		seen[v] = true
-	}
-	if cfg.Mode == "interval" {
-		if cfg.Minutes != 15 && cfg.Minutes != 30 && cfg.Minutes != 60 && cfg.Minutes != 120 && cfg.Minutes != 240 {
-			return fmt.Errorf("低频定频支持 15、30、60、120、240 分钟")
-		}
-	}
-	if cfg.Mode == "temporary" {
-		if cfg.Minutes != 15 && cfg.Minutes != 30 && cfg.Minutes != 60 {
-			return fmt.Errorf("临时频率支持 15、30、60 分钟")
-		}
-		until, e := time.Parse(time.RFC3339, cfg.Until)
-		if e != nil || !until.After(now) || until.Sub(now) > 12*time.Hour {
-			return fmt.Errorf("临时采集时长须在 12 小时以内")
-		}
-	}
-	return nil
-}
-func (s *DesktopService) schedule(ctx context.Context) (ScheduleConfig, error) {
-	raw, e := s.store.setting(ctx, "desktop_schedule_v1")
+func (s *DesktopService) schedule(ctx context.Context) (marketclock.ScheduleConfig, error) {
+	raw, e := s.store.Setting(ctx, "desktop_schedule_v1")
 	if e != nil {
-		return ScheduleConfig{}, e
+		return marketclock.ScheduleConfig{}, e
 	}
-	cfg := defaultSchedule()
+	cfg := marketclock.DefaultSchedule()
 	if raw != "" {
 		if e = json.Unmarshal([]byte(raw), &cfg); e != nil {
 			return cfg, e
 		}
 	}
-	cfg = cfg.effective(s.now())
-	if e = validateSchedule(cfg, s.now()); e != nil {
+	cfg = cfg.Effective(s.now())
+	if e = marketclock.ValidateSchedule(cfg, s.now()); e != nil {
 		return cfg, e
 	}
 	return cfg, nil
 }
-func (s *DesktopService) saveSchedule(ctx context.Context, cfg ScheduleConfig) error {
-	if e := validateSchedule(cfg, s.now()); e != nil {
+func (s *DesktopService) saveSchedule(ctx context.Context, cfg marketclock.ScheduleConfig) error {
+	if e := marketclock.ValidateSchedule(cfg, s.now()); e != nil {
 		return e
 	}
 	sort.Strings(cfg.Times)
 	b, _ := json.Marshal(cfg)
-	return s.store.transaction(ctx, func(tx *sql.Tx) error {
-		if e := setSetting(tx, "desktop_schedule_v1", string(b)); e != nil {
+	err := s.store.Transaction(ctx, func(tx *sql.Tx) error {
+		if e := store.SetSetting(tx, "desktop_schedule_v1", string(b)); e != nil {
 			return e
 		}
 		// The legacy browser scheduler must not silently resume an old interval.
-		return setSetting(tx, "collector_interval_minutes", "0")
+		return store.SetSetting(tx, "collector_interval_minutes", "0")
 	})
+	if err == nil {
+		s.wakeScheduler()
+	}
+	return err
 }
 
-type SessionHours struct {
-	Open  string `json:"open"`
-	Close string `json:"close"`
+func (s *DesktopService) calendar(_ context.Context) (map[string]marketclock.SessionHours, error) {
+	return marketclock.Window(s.now(), 45, 45), nil
+}
+func (s *DesktopService) wakeScheduler() {
+	select {
+	case s.scheduleWake <- struct{}{}:
+	default:
+	}
 }
 
-func localTime(day, clock string) (time.Time, error) {
-	return time.ParseInLocation("2006-01-02 15:04", day+" "+clock, marketZone)
+func activeHighFreq(cfg store.TickerCollectConfig, now time.Time) bool {
+	until, err := time.Parse(time.RFC3339, cfg.HighFreqUntil)
+	return cfg.HighFreqEnabled && err == nil && now.Before(until)
 }
 
-// No backlog replay: a wake-up may take only the latest slot within 15 minutes.
-func dueSlot(now time.Time, cfg ScheduleConfig, sessions map[string]SessionHours) (string, bool) {
-	cfg = cfg.effective(now)
-	if cfg.Mode == "manual" {
-		return "", false
+func (s *DesktopService) saveTickerConfig(ctx context.Context, cfg store.TickerCollectConfig) error {
+	ticker, err := provider.NormalizeSymbol(cfg.Ticker)
+	if err != nil {
+		return err
 	}
-	day := now.In(marketZone).Format("2006-01-02")
-	hours, ok := sessions[day]
-	if !ok {
-		return "", false
+	old, err := s.store.TickerCollectConfig(ctx, ticker)
+	if err != nil {
+		return err
 	}
-	if cfg.Mode == "temporary" || cfg.Mode == "interval" {
-		open, _ := localTime(day, hours.Open)
-		closeAt, _ := localTime(day, hours.Close)
-		if now.Before(open) || !now.Before(closeAt) {
-			return "", false
-		}
-		mins := max(1, cfg.Minutes)
-		slot := now.Unix() / int64(mins*60)
-		scope := cfg.Until
-		if cfg.Mode == "interval" {
-			scope = "interval"
-		}
-		return fmt.Sprintf("interval/%s/%d/%d", scope, mins, slot), true
+	now := s.now()
+	if cfg.HighFreqMinutes <= 0 {
+		cfg.HighFreqMinutes = old.HighFreqMinutes
 	}
-	var latest time.Time
-	for _, clock := range cfg.Times {
-		at, e := localTime(day, clock)
-		if e == nil && !at.After(now) && at.After(latest) {
-			latest = at
-		}
-	}
-	if latest.IsZero() || now.Sub(latest) >= 15*time.Minute {
-		return "", false
-	}
-	return "fixed/" + latest.Format(time.RFC3339), true
-}
-func nextSlot(now time.Time, cfg ScheduleConfig, sessions map[string]SessionHours) string {
-	cfg = cfg.effective(now)
-	if cfg.Mode == "manual" {
-		return "仅手动"
-	}
-	if cfg.Mode == "interval" {
-		return fmt.Sprintf("盘中每 %d 分钟自动低频采集", cfg.Minutes)
-	}
-	if cfg.Mode == "temporary" {
-		until, _ := time.Parse(time.RFC3339, cfg.Until)
-		return fmt.Sprintf("临时每 %d 分钟，至 %s", cfg.Minutes, until.In(marketZone).Format("15:04 MST"))
-	}
-	for d := 0; d < 35; d++ {
-		day := now.In(marketZone).AddDate(0, 0, d).Format("2006-01-02")
-		if _, ok := sessions[day]; !ok {
-			continue
-		}
-		for _, clock := range cfg.Times {
-			at, e := localTime(day, clock)
-			if e == nil && at.After(now) {
-				return at.Format("01-02 15:04 MST")
+	cfg.HighFreqMinutes = min(390, cfg.HighFreqMinutes)
+	cfg.HighFreqUntil = ""
+	if cfg.HighFreqEnabled {
+		if activeHighFreq(old, now) && old.HighFreqMinutes == cfg.HighFreqMinutes {
+			cfg.HighFreqUntil = old.HighFreqUntil
+		} else {
+			for day := now.In(marketclock.Zone); ; day = day.AddDate(0, 0, 1) {
+				hours, ok := marketclock.Session(day)
+				if !ok {
+					continue
+				}
+				open, closeAt, _ := marketclock.SessionBounds(day, hours)
+				if !now.Before(closeAt) {
+					continue
+				}
+				start := now
+				if start.Before(open) {
+					start = open
+				}
+				until := start.Add(time.Duration(cfg.HighFreqMinutes) * time.Minute)
+				if until.After(closeAt) {
+					until = closeAt
+				}
+				cfg.HighFreqUntil = until.Format(time.RFC3339)
+				break
 			}
 		}
 	}
-	return "等待交易日历"
+	if err := s.store.SaveTickerCollectConfig(ctx, cfg); err != nil {
+		return err
+	}
+	s.wakeScheduler()
+	return nil
 }
-func (s *DesktopService) calendar(_ context.Context) (map[string]SessionHours, error) {
-	return nyseCalendarWindow(s.now(), 45, 45), nil
+
+func earlier(a, b time.Time) time.Time {
+	if a.IsZero() || (!b.IsZero() && b.Before(a)) {
+		return b
+	}
+	return a
 }
+
+// Next clock event, including a premarket wake and earlier custom fixed slots.
+func nextScheduleWake(now time.Time, cfg marketclock.ScheduleConfig) time.Time {
+	now = now.In(marketclock.Zone)
+	cfg = cfg.Effective(now)
+	if cfg.Mode == "manual" {
+		return time.Time{}
+	}
+	var next time.Time
+	if cfg.Mode == "temporary" {
+		next, _ = time.Parse(time.RFC3339, cfg.Until)
+	}
+	for offset := 0; offset < 45; offset++ {
+		day := now.AddDate(0, 0, offset)
+		hours, ok := marketclock.Session(day)
+		if !ok {
+			continue
+		}
+		open, closeAt, _ := marketclock.SessionBounds(day, hours)
+		if prep := open.Add(-5 * time.Minute); prep.After(now) {
+			next = earlier(next, prep)
+		}
+		if cfg.Mode == "fixed" {
+			for _, clock := range cfg.Times {
+				at, err := time.ParseInLocation("2006-01-02 15:04", day.Format("2006-01-02")+" "+clock, marketclock.Zone)
+				if err == nil && at.After(now) {
+					next = earlier(next, at)
+				}
+			}
+		} else {
+			at := open
+			if !now.Before(open) {
+				period := time.Duration(cfg.Minutes) * time.Minute
+				at = now.Truncate(period).Add(period)
+			}
+			if at.Before(closeAt) {
+				next = earlier(next, at)
+			}
+		}
+		if !next.IsZero() {
+			break
+		}
+	}
+	return next
+}
+
 func (s *DesktopService) scheduler() {
 	defer s.wg.Done()
-	timer := time.NewTicker(5 * time.Second)
-	defer timer.Stop()
-	for {
-		s.scheduleTick()
-		s.highFreqTick()
+	var lastSlot string
+	var cfg marketclock.ScheduleConfig
+	var tickers map[string]store.TickerCollectConfig
+	reload := true
+	for s.ctx.Err() == nil {
+		if reload {
+			var err error
+			cfg, err = s.schedule(s.ctx)
+			if err != nil {
+				s.setStatus("error", err.Error())
+				cfg.Mode = "manual"
+			}
+			watch, err := s.store.Watchlist(s.ctx)
+			if err == nil {
+				tickers, err = s.store.TickerCollectConfigs(s.ctx, watch)
+			}
+			if err != nil {
+				s.setStatus("error", err.Error())
+			}
+		}
+		now := s.now()
+		wakeAt := nextScheduleWake(now, cfg)
+		s.cleanupIntraday(marketclock.Day(now).Format("2006-01-02"), tickers)
+		day := now.In(marketclock.Zone).Format("2006-01-02")
+		hours, trading := marketclock.Session(now)
+		if trading {
+			sessions := map[string]marketclock.SessionHours{day: hours}
+			if key, due := marketclock.DueSlot(now, cfg, sessions); due && key != lastSlot && s.runScheduleSlot(key) {
+				lastSlot = key
+			}
+		}
+		for ticker, config := range tickers {
+			wakeAt = earlier(wakeAt, s.runHighFreqIfDue(s.ctx, ticker, config))
+		}
+		reload = false
+		var timer *time.Timer
+		var due <-chan time.Time
+		if !wakeAt.IsZero() {
+			timer = time.NewTimer(max(0, wakeAt.Sub(s.now())))
+			due = timer.C
+		}
 		select {
 		case <-s.ctx.Done():
-			return
-		case <-timer.C:
+		case <-s.scheduleWake:
+			reload = true
+		case <-due:
+		}
+		if timer != nil {
+			timer.Stop()
 		}
 	}
 }
-func (s *DesktopService) highFreqTick() {
-	watch, err := s.store.watchlist(s.ctx)
-	if err != nil || len(watch) == 0 {
-		return
-	}
+
+func (s *DesktopService) runHighFreqIfDue(ctx context.Context, ticker string, cfg store.TickerCollectConfig) time.Time {
 	now := s.now()
-	for _, ticker := range watch {
-		if s.ctx.Err() != nil {
-			return
-		}
-		cfg, err := s.store.tickerCollectConfig(s.ctx, ticker)
-		if err != nil || !cfg.HighFreqEnabled {
-			continue
-		}
-		sec := normalizeHighFreqSec(cfg.HighFreqSec)
-		s.intradayMu.Lock()
-		lastAt := s.lastHighFreqAt[ticker]
-		s.intradayMu.Unlock()
-		if !lastAt.IsZero() && now.Sub(lastAt) < time.Duration(sec)*time.Second {
-			continue
-		}
-		_ = s.collectHighFreqTick(s.ctx, ticker)
+	if !activeHighFreq(cfg, now) {
+		return time.Time{}
 	}
+	until, _ := time.Parse(time.RFC3339, cfg.HighFreqUntil)
+	hours, trading := marketclock.Session(until)
+	if !trading {
+		return time.Time{}
+	}
+	open, closeAt, _ := marketclock.SessionBounds(until, hours)
+	if !now.Before(closeAt) {
+		return time.Time{}
+	}
+	if now.Before(open) {
+		if prep := open.Add(-5 * time.Minute); prep.After(now) {
+			return earlier(prep, until)
+		}
+		return earlier(open, until)
+	}
+	interval := time.Duration(cfg.HighFreqSec) * time.Second
+	s.intradayMu.Lock()
+	last := s.lastHighFreqAt[ticker]
+	retryAt := s.highFreqRetry[ticker]
+	s.intradayMu.Unlock()
+	next := last.Add(interval)
+	if retryAt.After(next) {
+		next = retryAt
+	}
+	if next.After(now) {
+		return earlier(next, earlier(until, closeAt))
+	}
+	if !s.collectMu.TryLock() {
+		// The manual collection signals the scheduler when it releases the lock.
+		return earlier(until, closeAt)
+	}
+	until = earlier(until, closeAt)
+	task, cancel := context.WithTimeout(ctx, until.Sub(now))
+	err := s.collectHighFreqLocked(task, ticker)
+	cancel()
+	s.collectMu.Unlock()
+	finished := s.now()
+	if err != nil {
+		next = finished.Add(max(interval, 5*time.Minute))
+		s.intradayMu.Lock()
+		s.highFreqRetry[ticker] = next
+		s.intradayMu.Unlock()
+	} else {
+		next = finished.Add(interval)
+	}
+	return earlier(next, earlier(until, closeAt))
 }
 func (s *DesktopService) scheduleTick() {
 	cfg, e := s.schedule(s.ctx)
@@ -228,18 +285,22 @@ func (s *DesktopService) scheduleTick() {
 		s.setStatus("error", "交易日历暂不可用: "+e.Error())
 		return
 	}
-	key, due := dueSlot(s.now(), cfg, sessions)
+	key, due := marketclock.DueSlot(s.now(), cfg, sessions)
 	if !due {
 		return
 	}
+	s.runScheduleSlot(key)
+}
+
+func (s *DesktopService) runScheduleSlot(key string) bool {
 	// One pass at a time, including manual actions and maintenance.
 	if !s.collectMu.TryLock() {
-		return
+		return false
 	}
 	defer s.collectMu.Unlock()
 	claimed := false
-	e = s.store.transaction(s.ctx, func(tx *sql.Tx) error {
-		res, e := tx.ExecContext(s.ctx, `INSERT OR IGNORE INTO desktop_schedule_runs(slot_key,started_at,status) VALUES(?,?,'running')`, key, stamp(s.now()))
+	e := s.store.Transaction(s.ctx, func(tx *sql.Tx) error {
+		res, e := tx.ExecContext(s.ctx, `INSERT OR IGNORE INTO desktop_schedule_runs(slot_key,started_at,status) VALUES(?,?,'running')`, key, marketclock.Stamp(s.now()))
 		if e != nil {
 			return e
 		}
@@ -248,7 +309,7 @@ func (s *DesktopService) scheduleTick() {
 		return e
 	})
 	if e != nil || !claimed {
-		return
+		return e == nil
 	}
 	results, e := s.collectScheduledLocked(s.ctx)
 	status := "success"
@@ -260,8 +321,9 @@ func (s *DesktopService) scheduleTick() {
 			status = "failed"
 		}
 	}
-	_ = s.store.transaction(s.ctx, func(tx *sql.Tx) error {
-		_, e := tx.ExecContext(s.ctx, "UPDATE desktop_schedule_runs SET finished_at=?,status=? WHERE slot_key=?", stamp(s.now()), status, key)
+	_ = s.store.Transaction(s.ctx, func(tx *sql.Tx) error {
+		_, e := tx.ExecContext(s.ctx, "UPDATE desktop_schedule_runs SET finished_at=?,status=? WHERE slot_key=?", marketclock.Stamp(s.now()), status, key)
 		return e
 	})
+	return true
 }

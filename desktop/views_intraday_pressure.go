@@ -5,6 +5,8 @@ import (
 	"math"
 	"strings"
 
+	"gammagrid.local/desktop/internal/viewmodel"
+
 	"github.com/egoist/mygo/ui"
 )
 
@@ -12,7 +14,7 @@ import (
 // Workbench Section 2: Intraday Volume/Premium Bars (Chart 1) & Weekly DTE Tide (Chart 2)
 // ============================================================================
 
-func (a *DesktopApp) activeIntradayBars(intr *IntradaySummary) ([]IntradayBar, bool) {
+func (a *DesktopApp) activeIntradayBars(intr *viewmodel.IntradaySummary) ([]viewmodel.IntradayBar, bool) {
 	if intr == nil {
 		return nil, false
 	}
@@ -28,7 +30,7 @@ func (a *DesktopApp) activeIntradayBars(intr *IntradaySummary) ([]IntradayBar, b
 	return intr.StrikeBars, true
 }
 
-func (a *DesktopApp) renderIntradayTideSection(c *ui.Context, wb *WorkbenchResponse) {
+func (a *DesktopApp) renderIntradayTideSection(c *ui.Context, wb *viewmodel.WorkbenchResponse) {
 	intr := &wb.Intraday
 	bars, isStrikeMode := a.activeIntradayBars(intr)
 
@@ -38,7 +40,7 @@ func (a *DesktopApp) renderIntradayTideSection(c *ui.Context, wb *WorkbenchRespo
 	})
 }
 
-func (a *DesktopApp) renderIntradayVolumeChartCard(c *ui.Context, ticker string, intr *IntradaySummary, bars []IntradayBar, isStrikeMode bool) {
+func (a *DesktopApp) renderIntradayVolumeChartCard(c *ui.Context, ticker string, intr *viewmodel.IntradaySummary, bars []viewmodel.IntradayBar, isStrikeMode bool) {
 	ui.Column(c).Grow(1).Basis(0).MinWidth(0).Radius(8).
 		Background(colorSurface).Border(1, colorBorder).Clip().Children(func() {
 		// Top Summary Header (matching Screenshot 1: Date | Vol | Prem | Net Prem)
@@ -113,7 +115,7 @@ func (a *DesktopApp) renderIntradayVolumeChartCard(c *ui.Context, ticker string,
 	})
 }
 
-func (a *DesktopApp) renderIntradayVolumeCanvas(c *ui.Context, ticker string, bars []IntradayBar, isStrikeMode bool) {
+func (a *DesktopApp) renderIntradayVolumeCanvas(c *ui.Context, ticker string, bars []viewmodel.IntradayBar, isStrikeMode bool) {
 	if len(bars) == 0 {
 		ui.Column(c).Height(250).Center().Children(func() {
 			ui.Text(c, "暂无日内期权成交数据").FontSize(12).TextColor(colorFaint)
@@ -308,7 +310,7 @@ func (a *DesktopApp) renderIntradayVolumeCanvas(c *ui.Context, ticker string, ba
 	})
 }
 
-func (a *DesktopApp) renderWeeklyDTETideCard(c *ui.Context, ticker string, intr *IntradaySummary, bars []IntradayBar, isStrikeMode bool) {
+func (a *DesktopApp) renderWeeklyDTETideCard(c *ui.Context, ticker string, intr *viewmodel.IntradaySummary, bars []viewmodel.IntradayBar, isStrikeMode bool) {
 	ui.Column(c).Grow(1).Basis(0).MinWidth(0).Radius(8).
 		Background(colorSurface).Border(1, colorBorder).Clip().Children(func() {
 		// Top Summary Header for Weekly DTE Tide
@@ -364,7 +366,7 @@ func (a *DesktopApp) renderWeeklyDTETideCard(c *ui.Context, ticker string, intr 
 	})
 }
 
-func (a *DesktopApp) renderWeeklyDTETideCanvas(c *ui.Context, ticker string, bars []IntradayBar, isStrikeMode bool) {
+func (a *DesktopApp) renderWeeklyDTETideCanvas(c *ui.Context, ticker string, bars []viewmodel.IntradayBar, isStrikeMode bool) {
 	if len(bars) == 0 {
 		ui.Column(c).Height(250).Center().Children(func() {
 			ui.Text(c, "暂无 Weekly (0–7 DTE) 潮汐数据").FontSize(12).TextColor(colorFaint)
@@ -563,7 +565,7 @@ func (a *DesktopApp) renderWeeklyDTETideCanvas(c *ui.Context, ticker string, bar
 // Workbench Section 3: Integrated Volatility Surface & Term Structure
 // ============================================================================
 
-func (a *DesktopApp) renderWorkbenchVolatilitySection(c *ui.Context, vol *VolatilityResponse) {
+func (a *DesktopApp) renderWorkbenchVolatilitySection(c *ui.Context, vol *viewmodel.VolatilityResponse) {
 	if vol == nil || vol.Empty {
 		return
 	}
@@ -647,7 +649,7 @@ func (a *DesktopApp) renderStrikePressureView(c *ui.Context) {
 				}
 			})
 			if wb.StrikeLower != nil && wb.StrikeUpper != nil {
-				ui.Textf(c, "$%s – $%s", fmtPriceVal(*wb.StrikeLower, 2), fmtPriceVal(*wb.StrikeUpper, 2)).
+				ui.Textf(c, "$%s – $%s", viewmodel.FmtPriceVal(*wb.StrikeLower, 2), viewmodel.FmtPriceVal(*wb.StrikeUpper, 2)).
 					Font("monospace").FontSize(11).TextColor(colorMuted)
 			}
 
@@ -670,7 +672,7 @@ func (a *DesktopApp) renderStrikePressureView(c *ui.Context) {
 	})
 }
 
-func (a *DesktopApp) renderStrikePressureChartCard(c *ui.Context, wb *WorkbenchResponse) {
+func (a *DesktopApp) renderStrikePressureChartCard(c *ui.Context, wb *viewmodel.WorkbenchResponse) {
 	ui.Column(c).Grow(1.5).Basis(0).MinWidth(0).MinHeight(0).Radius(8).
 		Background(colorSurface).Border(1, colorBorder).Clip().Children(func() {
 		ui.Row(c).Padding(8, 12).Gap(10).AlignItems(ui.Center).
@@ -694,7 +696,7 @@ func (a *DesktopApp) renderStrikePressureChartCard(c *ui.Context, wb *WorkbenchR
 				}
 				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
 					ui.Box(c).Size(8, 2.5).Radius(1).Background(colorSpot)
-					ui.Textf(c, "快照现价 %s", fmtPriceVal(wb.Spot, 2)).Font("monospace").FontSize(10.5).TextColor(colorSpot)
+					ui.Textf(c, "快照现价 %s", viewmodel.FmtPriceVal(wb.Spot, 2)).Font("monospace").FontSize(10.5).TextColor(colorSpot)
 				})
 			})
 		})
@@ -924,7 +926,7 @@ func (a *DesktopApp) renderStrikePressureChartCard(c *ui.Context, wb *WorkbenchR
 	})
 }
 
-func (a *DesktopApp) renderStrikePressureTableCard(c *ui.Context, wb *WorkbenchResponse) {
+func (a *DesktopApp) renderStrikePressureTableCard(c *ui.Context, wb *viewmodel.WorkbenchResponse) {
 	ui.Column(c).Grow(1.0).Basis(0).MinWidth(0).MinHeight(0).Radius(8).
 		Background(colorSurface).Border(1, colorBorder).Clip().Children(func() {
 		ui.Row(c).Padding(8, 12).Gap(8).AlignItems(ui.Center).

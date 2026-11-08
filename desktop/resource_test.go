@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -11,6 +12,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gammagrid.local/desktop/internal/provider"
+	"gammagrid.local/desktop/internal/store"
 )
 
 // Opt-in local measurement. GEX_PERF_DB must name a disposable SQLite backup.
@@ -21,14 +25,14 @@ func TestResourceAudit(t *testing.T) {
 		t.Skip("set GEX_PERF_DB to a disposable database copy")
 	}
 	root, _ := filepath.Abs("..")
-	store, e := openStore(root, path)
+	database, e := store.Open(root, path)
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer store.Close()
-	service := newDesktopService(store, root, "")
+	defer database.Close()
+	service := newDesktopService(database, root)
 	defer service.Close()
-	client := newLocalAPIClient(service)
+	ctx := context.Background()
 	process := func() string {
 		b, _ := exec.Command("ps", "-axo", "pid=,ppid=,rss=,time=,comm=").Output()
 		var out []string
@@ -44,7 +48,7 @@ func TestResourceAudit(t *testing.T) {
 	timings := []float64{}
 	for i := 0; i < 100; i++ {
 		start := time.Now()
-		if _, e := client.FetchState(); e != nil {
+		if _, e := service.state(ctx); e != nil {
 			t.Fatal(e)
 		}
 		timings = append(timings, float64(time.Since(start).Microseconds())/1000)
@@ -55,22 +59,22 @@ func TestResourceAudit(t *testing.T) {
 	result["state_warm_median_ms"] = warm[len(warm)/2]
 	result["after_state"] = process()
 	start := time.Now()
-	if _, e := client.FetchWorkbench("SPX", "gex", "net", "", 12, 20); e != nil {
+	if _, e := service.Workbench(ctx, "SPX", workbenchQuery{Dimension: "gex", Expiries: 12, Strikes: 20}); e != nil {
 		t.Fatal(e)
 	}
 	result["workbench_cold_ms"] = float64(time.Since(start).Microseconds()) / 1000
 	start = time.Now()
-	if _, e := client.FetchWorkbench("SPX", "gex", "net", "", 12, 20); e != nil {
+	if _, e := service.Workbench(ctx, "SPX", workbenchQuery{Dimension: "gex", Expiries: 12, Strikes: 20}); e != nil {
 		t.Fatal(e)
 	}
 	result["workbench_cached_ms"] = float64(time.Since(start).Microseconds()) / 1000
 	start = time.Now()
-	if _, e := client.FetchChain("SPX", "", "all", 10, 0); e != nil {
+	if _, e := service.Chain(ctx, "SPX", chainQuery{Band: 10}); e != nil {
 		t.Fatal(e)
 	}
 	result["chain_page_cold_ms"] = float64(time.Since(start).Microseconds()) / 1000
 	start = time.Now()
-	if _, e := client.FetchChain("SPX", "", "all", 10, 0); e != nil {
+	if _, e := service.Chain(ctx, "SPX", chainQuery{Band: 10}); e != nil {
 		t.Fatal(e)
 	}
 	result["chain_page_cached_ms"] = float64(time.Since(start).Microseconds()) / 1000
@@ -82,7 +86,7 @@ func TestResourceAudit(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			start := time.Now()
-			_, errs[i] = client.FetchWorkbench("SPX", "vanna", "net", "", 24, 40)
+			_, errs[i] = service.Workbench(ctx, "SPX", workbenchQuery{Dimension: "vanna", Expiries: 24, Strikes: 40})
 			burst[i] = float64(time.Since(start).Microseconds()) / 1000
 		}(i)
 	}
@@ -94,15 +98,15 @@ func TestResourceAudit(t *testing.T) {
 	}
 	result["burst_6_ms"] = burst
 	result["after_burst"] = process()
-	result["read_pool"] = store.read.Stats()
-	result["write_pool"] = store.write.Stats()
+	result["read_pool"] = database.Read().Stats()
+	result["write_pool"] = database.WriteStats()
 	if raw := os.Getenv("GEX_CBOE_FIXTURE"); raw != "" {
 		b, e := os.ReadFile(raw)
 		if e != nil {
 			t.Fatal(e)
 		}
 		start := time.Now()
-		snap, e := parseCboe(strings.NewReader(string(b)))
+		snap, e := provider.ParseCboe(strings.NewReader(string(b)))
 		if e != nil {
 			t.Fatal(e)
 		}

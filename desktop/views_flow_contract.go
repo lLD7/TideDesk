@@ -1,46 +1,23 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"math"
-	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"gammagrid.local/desktop/internal/marketclock"
+	"gammagrid.local/desktop/internal/store"
+	"gammagrid.local/desktop/internal/viewmodel"
 )
 
 // --- /api/contract in pure Go ---
-
-func (s *Store) contractHistory(ctx context.Context, ticker, source, expiry string, strike float64, optType string, days int) ([]StoredOptionRow, error) {
-	where := "ticker = ? AND substr(expiry,1,10) = ? AND strike = ? AND option_type = ?"
-	args := []any{strings.ToUpper(ticker), expiry, strike, optType}
-	if source != "" {
-		where += " AND source = ?"
-		args = append(args, source)
-	}
-	if days > 0 {
-		where += " AND collected_at >= datetime('now', '-' || ? || ' days')"
-		args = append(args, days)
-	}
-	q := fmt.Sprintf(`SELECT %s FROM option_snapshots WHERE %s
-		UNION ALL
-		SELECT %s FROM option_snapshots_archive WHERE %s
-		ORDER BY collected_at`, snapshotSelectCols, where, snapshotSelectCols, where)
-	rows, err := s.read.QueryContext(ctx, q, append(args, args...)...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanStoredOptionRows(rows)
-}
 
 func medianSorted(vals []float64) float64 {
 	n := len(vals)
@@ -57,7 +34,7 @@ func medianSorted(vals []float64) float64 {
 }
 
 // markUnreliableIV matches metrics_core._mark_unreliable_iv on a contract's sorted history.
-func markUnreliableIV(rows []StoredOptionRow) {
+func markUnreliableIV(rows []store.StoredOptionRow) {
 	var validIVs []float64
 	var validPrices []float64
 	for i := range rows {
@@ -107,17 +84,17 @@ func markUnreliableIV(rows []StoredOptionRow) {
 
 // lastSnapshotPerDay matches metrics_core._last_snapshot_per_day:
 // filters to Monday..Friday in America/New_York and keeps rows at each NY day's max collected_at.
-func lastSnapshotPerDay(rows []StoredOptionRow) []StoredOptionRow {
+func lastSnapshotPerDay(rows []store.StoredOptionRow) []store.StoredOptionRow {
 	if len(rows) == 0 {
 		return nil
 	}
 	maxMomentByDay := make(map[string]string)
 	for i := range rows {
-		t, ok := parseAnyTime(rows[i].CollectedAt)
+		t, ok := marketclock.ParseTime(rows[i].CollectedAt)
 		if !ok {
 			continue
 		}
-		ny := t.In(marketZone)
+		ny := t.In(marketclock.Zone)
 		wd := ny.Weekday()
 		if wd == time.Saturday || wd == time.Sunday {
 			continue
@@ -130,13 +107,13 @@ func lastSnapshotPerDay(rows []StoredOptionRow) []StoredOptionRow {
 	if len(maxMomentByDay) == 0 {
 		return nil
 	}
-	var out []StoredOptionRow
+	var out []store.StoredOptionRow
 	for i := range rows {
-		t, ok := parseAnyTime(rows[i].CollectedAt)
+		t, ok := marketclock.ParseTime(rows[i].CollectedAt)
 		if !ok {
 			continue
 		}
-		ny := t.In(marketZone)
+		ny := t.In(marketclock.Zone)
 		day := ny.Format("2006-01-02")
 		if maxMomentByDay[day] == rows[i].CollectedAt {
 			out = append(out, rows[i])
@@ -158,14 +135,14 @@ type greekAttrTotals struct {
 }
 
 // computeGreekAttribution matches metrics_core.greek_attribution.
-func computeGreekAttribution(history []StoredOptionRow) greekAttrTotals {
+func computeGreekAttribution(history []store.StoredOptionRow) greekAttrTotals {
 	daily := lastSnapshotPerDay(history)
 	if len(daily) < 2 {
 		return greekAttrTotals{}
 	}
 	sort.Slice(daily, func(i, j int) bool { return daily[i].CollectedAt < daily[j].CollectedAt })
 
-	var usable []StoredOptionRow
+	var usable []store.StoredOptionRow
 	for i := range daily {
 		r := &daily[i]
 		if isValidFinite(r.LastPrice) && !(math.IsNaN(r.UnderlyingPrice)) &&
@@ -195,8 +172,8 @@ func computeGreekAttribution(history []StoredOptionRow) greekAttrTotals {
 		p0 := *prev.LastPrice
 		p1 := *curr.LastPrice
 		cheap := math.Min(p0, p1) < attributionMinPrice
-		t0, _ := parseAnyTime(prev.CollectedAt)
-		t1, _ := parseAnyTime(curr.CollectedAt)
+		t0, _ := marketclock.ParseTime(prev.CollectedAt)
+		t1, _ := marketclock.ParseTime(curr.CollectedAt)
 		elapsedDays := t1.Sub(t0).Seconds() / 86400.0
 		dS := curr.UnderlyingPrice - prev.UnderlyingPrice
 		dIV := (*curr.IV - *prev.IV) * 100.0
@@ -248,27 +225,19 @@ func computeGreekAttribution(history []StoredOptionRow) greekAttrTotals {
 	return out
 }
 
-func (s *DesktopService) buildContractGo(ctx context.Context, q url.Values) (ContractResponse, error) {
-	ticker := strings.ToUpper(strings.TrimSpace(q.Get("ticker")))
-	if ticker == "" {
-		ticker = "SPY"
-	}
-	expiry := strings.TrimSpace(q.Get("expiry"))
-	strikeVal, _ := strconv.ParseFloat(q.Get("strike"), 64)
-	optType := strings.ToLower(strings.TrimSpace(q.Get("type")))
-	if optType != "call" && optType != "put" {
+func (s *DesktopService) buildContractGo(ctx context.Context, m store.SnapshotMeta, q contractQuery) (viewmodel.ContractResponse, error) {
+	ticker, source := m.Ticker, m.Source
+	expiry, strikeVal, optType := q.Expiry, q.Strike, q.Side
+	if optType != "put" {
 		optType = "call"
-	}
-	source, err := s.store.activeSource(ctx, ticker)
-	if err != nil {
-		return ContractResponse{}, err
 	}
 
 	if expiry == "" || strikeVal <= 0 {
-		_, latest, err := s.store.latestSnapshot(ctx, ticker, source)
-		if err != nil || len(latest) == 0 {
-			return ContractResponse{Empty: true}, nil
+		snapshot, err := s.snapshot(ctx, m)
+		if err != nil || len(snapshot.rows) == 0 {
+			return viewmodel.ContractResponse{Empty: true}, nil
 		}
+		latest := snapshot.rows
 		spot := latest[0].UnderlyingPrice
 		expSet := make(map[string]bool)
 		for i := range latest {
@@ -302,12 +271,14 @@ func (s *DesktopService) buildContractGo(ctx context.Context, q url.Values) (Con
 	if len(expiry) >= 10 {
 		expiry = expiry[:10]
 	}
-	hist, err := s.store.contractHistory(ctx, ticker, source, expiry, strikeVal, optType, snapshotHistoryDays())
+	hist, err := s.store.ContractHistory(ctx, ticker, source, expiry, strikeVal, optType, snapshotHistoryDays())
 	if err != nil || len(hist) == 0 {
-		return ContractResponse{Empty: true}, nil
+		return viewmodel.ContractResponse{Empty: true}, nil
 	}
 
-	withSolvedIV(hist, defaultRiskFreeRate, 0.0)
+	if err := solveSnapshotIV(ctx, hist); err != nil {
+		return viewmodel.ContractResponse{}, err
+	}
 	markUnreliableIV(hist)
 	for i := range hist {
 		row := &hist[i]
@@ -343,7 +314,7 @@ func (s *DesktopService) buildContractGo(ctx context.Context, q url.Values) (Con
 	}
 
 	attr := computeGreekAttribution(hist)
-	var attrSteps []AttributionStep
+	var attrSteps []viewmodel.AttributionStep
 	if attr.hasData {
 		type item struct {
 			key   string
@@ -372,7 +343,7 @@ func (s *DesktopService) buildContractGo(ctx context.Context, q url.Values) (Con
 				}
 				str = fmt.Sprintf("%+.1f¢", cents)
 			}
-			attrSteps = append(attrSteps, AttributionStep{
+			attrSteps = append(attrSteps, viewmodel.AttributionStep{
 				Label: it.label,
 				Cents: cents,
 				Str:   str,
@@ -380,13 +351,13 @@ func (s *DesktopService) buildContractGo(ctx context.Context, q url.Values) (Con
 			})
 		}
 	} else {
-		attrSteps = []AttributionStep{}
+		attrSteps = []viewmodel.AttributionStep{}
 	}
 
-	points := make([]ContractPoint, len(hist))
+	points := make([]viewmodel.ContractPoint, len(hist))
 	for i := range hist {
 		r := &hist[i]
-		points[i] = ContractPoint{
+		points[i] = viewmodel.ContractPoint{
 			Time:  fmtTimeMMDDHHMM(r.CollectedAt),
 			Price: r.LastPrice,
 			IV:    r.IV,
@@ -402,7 +373,7 @@ func (s *DesktopService) buildContractGo(ctx context.Context, q url.Values) (Con
 	if len(expiry) == 10 {
 		expYYMMDD = expiry[2:4] + expiry[5:7] + expiry[8:10]
 	}
-	name := fmt.Sprintf("%s %s %s%s", ticker, expYYMMDD, fmtStrikeVal(strikeVal), strings.ToUpper(optType[:1]))
+	name := fmt.Sprintf("%s %s %s%s", ticker, expYYMMDD, viewmodel.FmtStrikeVal(strikeVal), strings.ToUpper(optType[:1]))
 	deltaStr, gammaStr, thetaStr, vegaStr := "—", "—", "—", "—"
 	if isValidFinite(lastRow.Delta) {
 		deltaStr = fmt.Sprintf("%+.3f", *lastRow.Delta)
@@ -417,14 +388,14 @@ func (s *DesktopService) buildContractGo(ctx context.Context, q url.Values) (Con
 		vegaStr = fmt.Sprintf("%.3f", *lastRow.Vega)
 	}
 
-	return ContractResponse{
+	return viewmodel.ContractResponse{
 		Empty:       false,
 		Name:        name,
 		ExpiryISO:   expiry,
 		Strike:      strikeVal,
 		Type:        optType,
-		PriceStr:    fmtPrice(lastRow.LastPrice, 2),
-		IVStr:       fmtPct(lastRow.IV, 1, false),
+		PriceStr:    viewmodel.FmtPrice(lastRow.LastPrice, 2),
+		IVStr:       viewmodel.FmtPct(lastRow.IV, 1, false),
 		DeltaStr:    deltaStr,
 		GammaStr:    gammaStr,
 		ThetaStr:    thetaStr,
@@ -437,52 +408,9 @@ func (s *DesktopService) buildContractGo(ctx context.Context, q url.Values) (Con
 
 // --- /api/flow in pure Go ---
 
-type contractID struct {
-	expiry string
-	strike float64
-	side   string
-}
-
-type volStatRow struct {
-	avgVolume     *float64
-	stdVolume     *float64
-	historyPoints int
-}
-
-func (s *Store) volumeStatsMap(ctx context.Context, ticker, source string) (map[contractID]volStatRow, error) {
-	where := "ticker = ?"
-	args := []any{strings.ToUpper(ticker)}
-	if source != "" {
-		where += " AND source = ?"
-		args = append(args, source)
-	}
-	rows, err := s.read.QueryContext(ctx,
-		"SELECT substr(expiry,1,10), strike, option_type, avg_volume, std_volume, COALESCE(history_points,0) FROM contract_volume_stats WHERE "+where,
-		args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[contractID]volStatRow)
-	for rows.Next() {
-		var exp, side string
-		var strike float64
-		var avg, std sql.NullFloat64
-		var pts int
-		if err := rows.Scan(&exp, &strike, &side, &avg, &std, &pts); err == nil {
-			out[contractID{expiry: exp, strike: strike, side: side}] = volStatRow{
-				avgVolume:     nullFloatPtr(avg),
-				stdVolume:     nullFloatPtr(std),
-				historyPoints: pts,
-			}
-		}
-	}
-	return out, rows.Err()
-}
-
-func computeUnusualActivity(latest []StoredOptionRow, stats map[contractID]volStatRow) []UnusualRow {
+func computeUnusualActivity(latest []store.StoredOptionRow, stats map[store.ContractID]store.VolumeStat) []viewmodel.UnusualRow {
 	type flaggedItem struct {
-		row    *StoredOptionRow
+		row    *store.StoredOptionRow
 		avgVol *float64
 		zscore *float64
 	}
@@ -497,20 +425,20 @@ func computeUnusualActivity(latest []StoredOptionRow, stats map[contractID]volSt
 		if len(exp) >= 10 {
 			exp = exp[:10]
 		}
-		st := stats[contractID{expiry: exp, strike: r.Strike, side: r.OptionType}]
+		st := stats[store.ContractID{Expiry: exp, Strike: r.Strike, Side: r.OptionType}]
 		var z *float64
-		if st.avgVolume != nil && st.stdVolume != nil && *st.stdVolume != 0 {
-			zv := (vol - *st.avgVolume) / (*st.stdVolume)
+		if st.AvgVolume != nil && st.StdVolume != nil && *st.StdVolume != 0 {
+			zv := (vol - *st.AvgVolume) / (*st.StdVolume)
 			if !math.IsNaN(zv) && !math.IsInf(zv, 0) {
 				z = &zv
 			}
 		}
-		hasEnough := st.historyPoints >= unusualMinHistoryPoints
+		hasEnough := st.HistoryPoints >= unusualMinHistoryPoints
 		zFlag := hasEnough && z != nil && *z > unusualZThreshold
 		oiClip := math.Max(valOrZero(r.OI), 1.0)
 		fallbackFlag := !hasEnough && (vol > 2.0*oiClip)
 		if zFlag || fallbackFlag {
-			flagged = append(flagged, flaggedItem{row: r, avgVol: st.avgVolume, zscore: z})
+			flagged = append(flagged, flaggedItem{row: r, avgVol: st.AvgVolume, zscore: z})
 		}
 	}
 	sort.SliceStable(flagged, func(i, j int) bool {
@@ -529,7 +457,7 @@ func computeUnusualActivity(latest []StoredOptionRow, stats map[contractID]volSt
 	if len(flagged) > 150 {
 		flagged = flagged[:150]
 	}
-	out := make([]UnusualRow, len(flagged))
+	out := make([]viewmodel.UnusualRow, len(flagged))
 	for i, f := range flagged {
 		r := f.row
 		vol := valOrZero(r.Volume)
@@ -546,9 +474,9 @@ func computeUnusualActivity(latest []StoredOptionRow, stats map[contractID]volSt
 		if oi > 0 {
 			volOI = fmt.Sprintf("%.2fx", vol/oi)
 		}
-		out[i] = UnusualRow{
-			Expiry: fmtExpiryShort(r.Expiry),
-			Strike: fmtStrikeVal(r.Strike),
+		out[i] = viewmodel.UnusualRow{
+			Expiry: viewmodel.FmtExpiryShort(r.Expiry),
+			Strike: viewmodel.FmtStrikeVal(r.Strike),
 			Type:   strings.ToUpper(r.OptionType[:1]),
 			Volume: formatIntComma(int64(vol)),
 			OI:     formatIntComma(int64(oi)),
@@ -560,10 +488,10 @@ func computeUnusualActivity(latest []StoredOptionRow, stats map[contractID]volSt
 	return out
 }
 
-func computeOIDelta(twoDaysRows []StoredOptionRow) []OIDeltaRow {
+func computeOIDelta(twoDaysRows []store.StoredOptionRow) []viewmodel.OIDeltaRow {
 	daily := lastSnapshotPerDay(twoDaysRows)
 	if len(daily) == 0 {
-		return []OIDeltaRow{}
+		return []viewmodel.OIDeltaRow{}
 	}
 	momentSet := make(map[string]bool)
 	for i := range daily {
@@ -575,15 +503,15 @@ func computeOIDelta(twoDaysRows []StoredOptionRow) []OIDeltaRow {
 	}
 	sort.Strings(moments)
 	if len(moments) < 2 {
-		return []OIDeltaRow{}
+		return []viewmodel.OIDeltaRow{}
 	}
 	latestMoment := moments[len(moments)-1]
 	prevMoment := moments[len(moments)-2]
 
-	latestOI := make(map[contractID]float64)
-	prevOI := make(map[contractID]float64)
-	var keysOrder []contractID
-	seenKey := make(map[contractID]bool)
+	latestOI := make(map[store.ContractID]float64)
+	prevOI := make(map[store.ContractID]float64)
+	var keysOrder []store.ContractID
+	seenKey := make(map[store.ContractID]bool)
 	for i := range daily {
 		r := &daily[i]
 		if !isValidFinite(r.OI) {
@@ -593,7 +521,7 @@ func computeOIDelta(twoDaysRows []StoredOptionRow) []OIDeltaRow {
 		if len(exp) >= 10 {
 			exp = exp[:10]
 		}
-		cid := contractID{expiry: exp, strike: r.Strike, side: r.OptionType}
+		cid := store.ContractID{Expiry: exp, Strike: r.Strike, Side: r.OptionType}
 		if r.CollectedAt == latestMoment {
 			latestOI[cid] = *r.OI
 			if !seenKey[cid] {
@@ -606,7 +534,7 @@ func computeOIDelta(twoDaysRows []StoredOptionRow) []OIDeltaRow {
 	}
 
 	type deltaItem struct {
-		cid    contractID
+		cid    store.ContractID
 		oi     float64
 		delta  float64
 		pct    *float64
@@ -639,7 +567,7 @@ func computeOIDelta(twoDaysRows []StoredOptionRow) []OIDeltaRow {
 	if len(items) > 150 {
 		items = items[:150]
 	}
-	out := make([]OIDeltaRow, len(items))
+	out := make([]viewmodel.OIDeltaRow, len(items))
 	for i, it := range items {
 		dInt := int(it.delta)
 		pctStr := "—"
@@ -650,10 +578,10 @@ func computeOIDelta(twoDaysRows []StoredOptionRow) []OIDeltaRow {
 		if dInt >= 0 {
 			deltaStr = "+" + deltaStr
 		}
-		out[i] = OIDeltaRow{
-			Expiry:     fmtExpiryShort(it.cid.expiry),
-			Strike:     fmtStrikeVal(it.cid.strike),
-			Type:       strings.ToUpper(it.cid.side[:1]),
+		out[i] = viewmodel.OIDeltaRow{
+			Expiry:     viewmodel.FmtExpiryShort(it.cid.Expiry),
+			Strike:     viewmodel.FmtStrikeVal(it.cid.Strike),
+			Type:       strings.ToUpper(it.cid.Side[:1]),
 			OI:         formatIntComma(int64(it.oi)),
 			OIDelta:    dInt,
 			OIDeltaStr: deltaStr,
@@ -663,115 +591,7 @@ func computeOIDelta(twoDaysRows []StoredOptionRow) []OIDeltaRow {
 	return out
 }
 
-type daySummaryRecord struct {
-	Day            string
-	CollectedAt    string
-	Spot           float64
-	NetGEX         float64
-	CallWall       *float64
-	PutWall        *float64
-	GammaFlip      *float64
-	State          string
-	ExpiryCount    int
-	HorizonDTE     int
-	NearestExpiry  string
-	NearestMaxPain *float64
-	MoveLower      *float64
-	MoveUpper      *float64
-	Contracts      int
-	CallVolume     *int64
-	PutVolume      *int64
-	CallOI         *int64
-	PutOI          *int64
-	Expiries       []string
-	GEXByStrike    [][2]float64
-	CoreSHA        string
-}
-
-func (s *Store) sessionDays(ctx context.Context, ticker, source string, limit int) ([]string, error) {
-	rows, err := s.read.QueryContext(ctx,
-		`SELECT substr(CAST(day AS TEXT),1,10), CAST(collected_at AS TEXT) FROM ticker_day_summary
-		 WHERE ticker = ? AND source = ? ORDER BY day DESC`,
-		strings.ToUpper(ticker), source)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var days []string
-	for rows.Next() {
-		var d, colAt string
-		if err := rows.Scan(&d, &colAt); err == nil {
-			if sessionStartedAt(colAt) && marketDayString(colAt) == d {
-				days = append(days, d)
-				if limit > 0 && len(days) >= limit {
-					break
-				}
-			}
-		}
-	}
-	return days, rows.Err()
-}
-
-func (s *Store) daySummaryOn(ctx context.Context, ticker, source, day string) (*daySummaryRecord, error) {
-	var r daySummaryRecord
-	var cw, pw, gf, mp, ml, mu sql.NullFloat64
-	var nearExp, expJSON, gexJSON, sha sql.NullString
-	var cv, pv, coi, poi sql.NullInt64
-	err := s.read.QueryRowContext(ctx,
-		`SELECT substr(CAST(day AS TEXT),1,10), CAST(collected_at AS TEXT), underlying_price, net_gex, call_wall, put_wall, gamma_flip,
-		        state, expiry_count, horizon_dte, COALESCE(substr(CAST(nearest_expiry AS TEXT),1,10),''), nearest_max_pain,
-		        move_lower, move_upper, contracts, call_volume, put_volume, call_oi, put_oi,
-		        COALESCE(expiries,'[]'), COALESCE(gex_by_strike,'[]'), COALESCE(core_sha,'')
-		 FROM ticker_day_summary WHERE ticker = ? AND source = ? AND substr(CAST(day AS TEXT),1,10) = ?`,
-		strings.ToUpper(ticker), source, day,
-	).Scan(
-		&r.Day, &r.CollectedAt, &r.Spot, &r.NetGEX, &cw, &pw, &gf,
-		&r.State, &r.ExpiryCount, &r.HorizonDTE, &nearExp, &mp,
-		&ml, &mu, &r.Contracts, &cv, &pv, &coi, &poi,
-		&expJSON, &gexJSON, &sha,
-	)
-	if err != nil {
-		return nil, err
-	}
-	r.CallWall = nullFloatPtr(cw)
-	r.PutWall = nullFloatPtr(pw)
-	r.GammaFlip = nullFloatPtr(gf)
-	r.NearestExpiry = nearExp.String
-	r.NearestMaxPain = nullFloatPtr(mp)
-	r.MoveLower = nullFloatPtr(ml)
-	r.MoveUpper = nullFloatPtr(mu)
-	if cv.Valid {
-		v := cv.Int64
-		r.CallVolume = &v
-	}
-	if pv.Valid {
-		v := pv.Int64
-		r.PutVolume = &v
-	}
-	if coi.Valid {
-		v := coi.Int64
-		r.CallOI = &v
-	}
-	if poi.Valid {
-		v := poi.Int64
-		r.PutOI = &v
-	}
-	_ = json.Unmarshal([]byte(expJSON.String), &r.Expiries)
-	_ = json.Unmarshal([]byte(gexJSON.String), &r.GEXByStrike)
-	r.CoreSHA = sha.String
-	return &r, nil
-}
-
-func (s *Store) momentRollupIV(ctx context.Context, ticker, source, collectedAt string) *float64 {
-	var iv sql.NullFloat64
-	_ = s.read.QueryRowContext(ctx,
-		"SELECT iv_weighted_avg FROM snapshot_iv_summary WHERE ticker = ? AND source = ? AND collected_at = ?",
-		strings.ToUpper(ticker), source, collectedAt,
-	).Scan(&iv)
-	return nullFloatPtr(iv)
-}
-
-func strikeStepOf(r *daySummaryRecord) *float64 {
+func strikeStepOf(r *store.DaySummaryRecord) *float64 {
 	if r == nil || len(r.GEXByStrike) < 2 {
 		return nil
 	}
@@ -869,9 +689,9 @@ func isZeroPrinted(printed string) bool {
 }
 
 // buildChangesLadder matches day_summary.changes + format_value + format_delta.
-func buildChangesLadder(prev, curr *daySummaryRecord, prevIV, currIV *float64) []LadderRow {
+func buildChangesLadder(prev, curr *store.DaySummaryRecord, prevIV, currIV *float64) []viewmodel.LadderRow {
 	if curr == nil {
-		return []LadderRow{}
+		return []viewmodel.LadderRow{}
 	}
 	step := strikeStepOf(curr)
 	if step == nil {
@@ -1075,7 +895,7 @@ func buildChangesLadder(prev, curr *daySummaryRecord, prevIV, currIV *float64) [
 			if bd == nil {
 				return "—"
 			}
-			return fmt.Sprintf("%s – %s", fmtPriceVal(bd[0], 2), fmtPriceVal(bd[1], 2))
+			return fmt.Sprintf("%s – %s", viewmodel.FmtPriceVal(bd[0], 2), viewmodel.FmtPriceVal(bd[1], 2))
 		default:
 			v := l.after
 			if isBefore {
@@ -1094,7 +914,7 @@ func buildChangesLadder(prev, curr *daySummaryRecord, prevIV, currIV *float64) [
 			case "ratio":
 				return fmt.Sprintf("%.2f", *v)
 			default:
-				return fmtPriceVal(*v, 2)
+				return viewmodel.FmtPriceVal(*v, 2)
 			}
 		}
 	}
@@ -1137,7 +957,7 @@ func buildChangesLadder(prev, curr *daySummaryRecord, prevIV, currIV *float64) [
 				if st < 0 {
 					sign = "-"
 				}
-				printed = fmt.Sprintf("%s%s strike%s · %s", sign, fmtStrikeVal(math.Abs(st)), plural, fmtSignedPrice(d, 2))
+				printed = fmt.Sprintf("%s%s strike%s · %s", sign, viewmodel.FmtStrikeVal(math.Abs(st)), plural, fmtSignedPrice(d, 2))
 			} else {
 				printed = fmtSignedPrice(d, 2)
 			}
@@ -1189,7 +1009,7 @@ func buildChangesLadder(prev, curr *daySummaryRecord, prevIV, currIV *float64) [
 		"Contracts in the chain":   "合约数",
 	}
 
-	out := make([]LadderRow, len(lines))
+	out := make([]viewmodel.LadderRow, len(lines))
 	for i, l := range lines {
 		lbl := l.label
 		if strings.HasPrefix(lbl, "Max pain") {
@@ -1205,7 +1025,7 @@ func buildChangesLadder(prev, curr *daySummaryRecord, prevIV, currIV *float64) [
 		} else if l.kind == "amplifying" {
 			tone = "neg"
 		}
-		out[i] = LadderRow{
+		out[i] = viewmodel.LadderRow{
 			Label:  lbl,
 			Before: fmtSide(l, true),
 			After:  fmtSide(l, false),
@@ -1217,78 +1037,11 @@ func buildChangesLadder(prev, curr *daySummaryRecord, prevIV, currIV *float64) [
 }
 
 func fmtSignedPrice(val float64, digits int) string {
-	s := fmtPriceVal(math.Abs(val), digits)
+	s := viewmodel.FmtPriceVal(math.Abs(val), digits)
 	if val < 0 {
 		return "-" + s
 	}
 	return "+" + s
-}
-
-func (s *Store) putCallRatioSeries(ctx context.Context, ticker, source string, days int) ([]PCRPoint, error) {
-	where := "ticker = ?"
-	args := []any{strings.ToUpper(ticker)}
-	if source != "" {
-		where += " AND source = ?"
-		args = append(args, source)
-	}
-	if days > 0 {
-		where += " AND collected_at >= datetime('now', '-' || ? || ' days')"
-		args = append(args, days)
-	}
-	q := fmt.Sprintf(`SELECT CAST(collected_at AS TEXT), option_type, SUM(volume), SUM(open_interest)
-		FROM (
-			SELECT collected_at, option_type, volume, open_interest FROM option_snapshots WHERE %s
-			UNION ALL
-			SELECT collected_at, option_type, volume, open_interest FROM option_snapshots_archive WHERE %s
-		)
-		GROUP BY collected_at, option_type
-		ORDER BY collected_at`, where, where)
-	rows, err := s.read.QueryContext(ctx, q, append(args, args...)...)
-	if err != nil {
-		return []PCRPoint{}, err
-	}
-	defer rows.Close()
-
-	type sideSums struct {
-		cVol, pVol sql.NullFloat64
-		cOI, pOI   sql.NullFloat64
-	}
-	byMoment := make(map[string]*sideSums)
-	var order []string
-	for rows.Next() {
-		var m, side string
-		var vol, oi sql.NullFloat64
-		if err := rows.Scan(&m, &side, &vol, &oi); err == nil {
-			ss, exists := byMoment[m]
-			if !exists {
-				ss = &sideSums{}
-				byMoment[m] = ss
-				order = append(order, m)
-			}
-			if side == "call" {
-				ss.cVol = vol
-				ss.cOI = oi
-			} else if side == "put" {
-				ss.pVol = vol
-				ss.pOI = oi
-			}
-		}
-	}
-	out := make([]PCRPoint, len(order))
-	for i, m := range order {
-		ss := byMoment[m]
-		var pVol, pOI *float64
-		if ss.pVol.Valid && ss.cVol.Valid && ss.cVol.Float64 > 0 {
-			v := ss.pVol.Float64 / ss.cVol.Float64
-			pVol = &v
-		}
-		if ss.pOI.Valid && ss.cOI.Valid && ss.cOI.Float64 > 0 {
-			v := ss.pOI.Float64 / ss.cOI.Float64
-			pOI = &v
-		}
-		out[i] = PCRPoint{Time: fmtTimeMMDDHHMM(m), PCRVol: pVol, PCROI: pOI}
-	}
-	return out, rows.Err()
 }
 
 func fmtDayMMDD(iso string) string {
@@ -1298,48 +1051,42 @@ func fmtDayMMDD(iso string) string {
 	return iso
 }
 
-func (s *DesktopService) buildFlowGo(ctx context.Context, q url.Values) (FlowResponse, error) {
-	ticker := strings.ToUpper(strings.TrimSpace(q.Get("ticker")))
-	if ticker == "" {
-		ticker = "SPY"
-	}
-	source, err := s.store.activeSource(ctx, ticker)
+func (s *DesktopService) buildFlowGo(ctx context.Context, m store.SnapshotMeta) (viewmodel.FlowResponse, error) {
+	ticker, source := m.Ticker, m.Source
+	snapshot, err := s.snapshot(ctx, m)
 	if err != nil {
-		return FlowResponse{}, err
+		return viewmodel.FlowResponse{}, err
 	}
-	_, latest, err := s.store.latestSnapshot(ctx, ticker, source)
-	if err != nil {
-		return FlowResponse{}, err
-	}
+	latest := snapshot.rows
 	if len(latest) == 0 {
-		return FlowResponse{
+		return viewmodel.FlowResponse{
 			Ticker:     ticker,
 			Empty:      true,
-			Unusual:    []UnusualRow{},
-			OIDelta:    []OIDeltaRow{},
-			Ladder:     []LadderRow{},
-			PCRHistory: []PCRPoint{},
+			Unusual:    []viewmodel.UnusualRow{},
+			OIDelta:    []viewmodel.OIDeltaRow{},
+			Ladder:     []viewmodel.LadderRow{},
+			PCRHistory: []viewmodel.PCRPoint{},
 		}, nil
 	}
 	spot := latest[0].UnderlyingPrice
 
-	statsMap, _ := s.store.volumeStatsMap(ctx, ticker, source)
+	statsMap, _ := s.store.VolumeStatsMap(ctx, ticker, source)
 	unusualRows := computeUnusualActivity(latest, statsMap)
 
-	dailyMoments, _ := s.store.collectionMoments(ctx, ticker, source, snapshotHistoryDays(), true)
-	var oiRows []OIDeltaRow
+	dailyMoments, _ := s.store.CollectionMoments(ctx, ticker, source, snapshotHistoryDays(), true)
+	var oiRows []viewmodel.OIDeltaRow
 	if len(dailyMoments) >= 2 {
-		twoDays, err := s.store.snapshotsAt(ctx, ticker, source, dailyMoments[:2])
+		twoDays, err := s.store.SnapshotsAt(ctx, ticker, source, dailyMoments[:2])
 		if err == nil {
 			oiRows = computeOIDelta(twoDays)
 		}
 	}
 	if oiRows == nil {
-		oiRows = []OIDeltaRow{}
+		oiRows = []viewmodel.OIDeltaRow{}
 	}
 
-	days, _ := s.store.sessionDays(ctx, ticker, source, 400)
-	ladder := []LadderRow{}
+	days, _ := s.store.SessionDays(ctx, ticker, source, 400)
+	ladder := []viewmodel.LadderRow{}
 	daysLabel := ""
 	if len(days) >= 1 {
 		dayAfter := days[0]
@@ -1348,23 +1095,27 @@ func (s *DesktopService) buildFlowGo(ctx context.Context, q url.Values) (FlowRes
 			dayBefore = days[1]
 		}
 		daysLabel = fmt.Sprintf("%s → %s", fmtDayMMDD(dayBefore), fmtDayMMDD(dayAfter))
-		after, err1 := s.store.daySummaryOn(ctx, ticker, source, dayAfter)
-		var before *daySummaryRecord
+		after, err1 := s.store.DaySummaryOn(ctx, ticker, source, dayAfter)
+		var before *store.DaySummaryRecord
 		if dayBefore != dayAfter {
-			before, _ = s.store.daySummaryOn(ctx, ticker, source, dayBefore)
+			before, _ = s.store.DaySummaryOn(ctx, ticker, source, dayBefore)
 		}
 		if err1 == nil && after != nil {
-			ivAfter := s.store.momentRollupIV(ctx, ticker, source, after.CollectedAt)
+			ivAfter := s.store.MomentRollupIV(ctx, ticker, source, after.CollectedAt)
 			var ivBefore *float64
 			if before != nil {
-				ivBefore = s.store.momentRollupIV(ctx, ticker, source, before.CollectedAt)
+				ivBefore = s.store.MomentRollupIV(ctx, ticker, source, before.CollectedAt)
 			}
 			ladder = buildChangesLadder(before, after, ivBefore, ivAfter)
 		}
 	}
 
-	pcrHist, _ := s.store.putCallRatioSeries(ctx, ticker, source, snapshotHistoryDays())
-	return FlowResponse{
+	pcrPoints, _ := s.store.PutCallRatioSeries(ctx, ticker, source, snapshotHistoryDays())
+	pcrHist := make([]viewmodel.PCRPoint, 0, len(pcrPoints))
+	for _, p := range pcrPoints {
+		pcrHist = append(pcrHist, viewmodel.PCRPoint{Time: fmtTimeMMDDHHMM(p.Time), PCRVol: p.PCRVol, PCROI: p.PCROI})
+	}
+	return viewmodel.FlowResponse{
 		Ticker:     ticker,
 		Empty:      false,
 		Spot:       spot,
@@ -1379,19 +1130,18 @@ func (s *DesktopService) buildFlowGo(ctx context.Context, q url.Values) (FlowRes
 
 // --- Pure Go derive (replaces /compute/derive) ---
 
-func buildDaySummaryRecord(rows []StoredOptionRow, r, q float64) *daySummaryRecord {
+func buildDaySummaryRecord(ctx context.Context, rows []store.StoredOptionRow, r, q float64) *store.DaySummaryRecord {
 	if len(rows) == 0 {
 		return nil
 	}
-	withSolvedIV(rows, r, q)
-	w := computeGammaWeatherPresolved(rows, r, q)
+	w := computeGammaWeatherPresolved(ctx, rows, r, q)
 	if w == nil {
 		return nil
 	}
-	if !sessionStartedAt(w.CollectedAt) {
+	if !marketclock.SessionStarted(w.CollectedAt) {
 		return nil
 	}
-	expMap := make(map[string][]StoredOptionRow)
+	expMap := make(map[string][]store.StoredOptionRow)
 	for i := range rows {
 		e := rows[i].Expiry
 		if len(e) >= 10 {
@@ -1440,8 +1190,8 @@ func buildDaySummaryRecord(rows []StoredOptionRow, r, q float64) *daySummaryReco
 	pvInt := int64(pVol)
 	coiInt := int64(cOI)
 	poiInt := int64(pOI)
-	return &daySummaryRecord{
-		Day:            marketDayString(w.CollectedAt),
+	return &store.DaySummaryRecord{
+		Day:            marketclock.MarketDay(w.CollectedAt),
 		CollectedAt:    w.CollectedAt,
 		Spot:           w.Spot,
 		NetGEX:         w.NetGEX,
@@ -1465,21 +1215,20 @@ func buildDaySummaryRecord(rows []StoredOptionRow, r, q float64) *daySummaryReco
 	}
 }
 
-func newDerivedWrite(sqlStmt string, args ...any) DerivedWrite {
-	b, _ := json.Marshal(args)
-	return DerivedWrite{SQL: sqlStmt, Params: b}
+func newDerivedWrite(sqlStmt string, args ...any) store.DerivedWrite {
+	return store.DerivedWrite{SQL: sqlStmt, Args: args}
 }
 
-func (s *DesktopService) deriveGo(ctx context.Context, ticker, source string) error {
+func (s *DesktopService) deriveGo(ctx context.Context, ticker, source string, latestOnly bool) error {
 	tkr := strings.ToUpper(strings.TrimSpace(ticker))
 	if source == "" {
 		var err error
-		source, err = s.store.activeSource(ctx, tkr)
+		source, err = s.store.ActiveSource(ctx, tkr)
 		if err != nil {
 			return err
 		}
 	}
-	var writes []DerivedWrite
+	var writes []store.DerivedWrite
 
 	// 1. Backfill pending snapshot_iv_summary rows (up to 50 newest moments).
 	wherePending := "ticker = ? AND iv_model IS NULL"
@@ -1488,9 +1237,13 @@ func (s *DesktopService) deriveGo(ctx context.Context, ticker, source string) er
 		wherePending += " AND source = ?"
 		argsPending = append(argsPending, source)
 	}
-	pRows, err := s.store.read.QueryContext(ctx,
+	pendingLimit := ivBackfillMomentsPerPass
+	if latestOnly {
+		pendingLimit = 1
+	}
+	pRows, err := s.store.Read().QueryContext(ctx,
 		"SELECT CAST(collected_at AS TEXT) FROM snapshot_iv_summary WHERE "+wherePending+" ORDER BY collected_at DESC LIMIT ?",
-		append(argsPending, ivBackfillMomentsPerPass)...)
+		append(argsPending, pendingLimit)...)
 	if err == nil {
 		var pendingMoments []string
 		for pRows.Next() {
@@ -1500,53 +1253,70 @@ func (s *DesktopService) deriveGo(ctx context.Context, ticker, source string) er
 			}
 		}
 		pRows.Close()
-		if len(pendingMoments) > 0 {
-			snapRows, err := s.store.snapshotsAt(ctx, tkr, source, pendingMoments)
-			if err == nil {
-				byMoment := make(map[string][]StoredOptionRow)
-				for i := range snapRows {
-					byMoment[snapRows[i].CollectedAt] = append(byMoment[snapRows[i].CollectedAt], snapRows[i])
+		modelName := "own"
+		if source == "cboe" {
+			modelName = "cboe_native"
+		}
+		for i, m := range pendingMoments {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			snap, err := s.snapshot(ctx, store.SnapshotMeta{Ticker: tkr, Source: source, At: m})
+			if err != nil {
+				return err
+			}
+			if i == 0 && source != "" && len(snap.rows) > 0 {
+				meta := store.SnapshotMeta{Ticker: tkr, Source: source, At: m}
+				ribbon, err := s.snapshotRibbon(ctx, meta, snap.rows)
+				if err != nil {
+					return err
 				}
-				modelName := "own"
-				if source == "cboe" {
-					modelName = "cboe_native"
+				payload, err := json.Marshal(ribbon)
+				if err != nil {
+					return err
 				}
-				for _, m := range pendingMoments {
-					mRows := byMoment[m]
-					withSolvedIV(mRows, defaultRiskFreeRate, 0.0)
-					avg := ivWeightedAveragePresolved(mRows)
-					if source != "" {
-						writes = append(writes, newDerivedWrite(
-							"UPDATE snapshot_iv_summary SET iv_weighted_avg=COALESCE(?, iv_weighted_avg), iv_model=? WHERE ticker=? AND source=? AND collected_at=?",
-							avg, modelName, tkr, source, m,
-						))
-					} else {
-						writes = append(writes, newDerivedWrite(
-							"UPDATE snapshot_iv_summary SET iv_weighted_avg=COALESCE(?, iv_weighted_avg), iv_model=? WHERE ticker=? AND collected_at=?",
-							avg, modelName, tkr, m,
-						))
-					}
-				}
+				writes = append(writes, newDerivedWrite(
+					"UPDATE snapshot_iv_summary SET ribbon_json=?,ribbon_model=? WHERE ticker=? AND source=? AND collected_at=?",
+					string(payload), ModelVersion, tkr, source, m,
+				))
+			}
+			avg := ivWeightedAveragePresolved(snap.rows)
+			if source != "" {
+				writes = append(writes, newDerivedWrite(
+					"UPDATE snapshot_iv_summary SET iv_weighted_avg=COALESCE(?, iv_weighted_avg), iv_model=? WHERE ticker=? AND source=? AND collected_at=?",
+					avg, modelName, tkr, source, m,
+				))
+			} else {
+				writes = append(writes, newDerivedWrite(
+					"UPDATE snapshot_iv_summary SET iv_weighted_avg=COALESCE(?, iv_weighted_avg), iv_model=? WHERE ticker=? AND collected_at=?",
+					avg, modelName, tkr, m,
+				))
 			}
 		}
 	}
 
 	// 2. Backfill missing ticker_day_summary rows.
 	if source != "" {
-		coreSHA := computeCoreSHA(s.root)
-		moments, err := s.store.collectionMoments(ctx, tkr, source, daySummaryBackfillDays, true)
+		modelVersion := ModelVersion
+		moments, err := s.store.CollectionMoments(ctx, tkr, source, daySummaryBackfillDays, true)
 		if err == nil {
+			if latestOnly && len(moments) > 1 {
+				moments = moments[:1]
+			}
 			for _, m := range moments {
-				day := marketDayString(m)
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				day := marketclock.MarketDay(m)
 				var existingAt, existingSHA string
-				err := s.store.read.QueryRowContext(ctx,
+				err := s.store.Read().QueryRowContext(ctx,
 					"SELECT COALESCE(CAST(collected_at AS TEXT),''), COALESCE(core_sha,'') FROM ticker_day_summary WHERE ticker=? AND source=? AND substr(CAST(day AS TEXT),1,10)=?",
 					tkr, source, day,
 				).Scan(&existingAt, &existingSHA)
-				if err != nil || existingSHA != coreSHA || existingAt < m {
-					mRows, err := s.store.snapshotsAt(ctx, tkr, source, []string{m})
-					if err == nil && len(mRows) > 0 {
-						if rec := buildDaySummaryRecord(mRows, defaultRiskFreeRate, 0.0); rec != nil {
+				if err != nil || existingSHA != modelVersion || existingAt < m {
+					snap, err := s.snapshot(ctx, store.SnapshotMeta{Ticker: tkr, Source: source, At: m})
+					if err == nil && len(snap.rows) > 0 {
+						if rec := buildDaySummaryRecord(ctx, snap.rows, defaultRiskFreeRate, 0.0); rec != nil {
 							expJSON, _ := json.Marshal(rec.Expiries)
 							gexJSON, _ := json.Marshal(rec.GEXByStrike)
 							var nearExp any
@@ -1566,13 +1336,14 @@ func (s *DesktopService) deriveGo(ctx context.Context, ticker, source string) er
 								nearest_max_pain=EXCLUDED.nearest_max_pain, move_lower=EXCLUDED.move_lower, move_upper=EXCLUDED.move_upper,
 								contracts=EXCLUDED.contracts, call_volume=EXCLUDED.call_volume, put_volume=EXCLUDED.put_volume,
 								call_oi=EXCLUDED.call_oi, put_oi=EXCLUDED.put_oi, expiries=EXCLUDED.expiries,
-								gex_by_strike=EXCLUDED.gex_by_strike, computed_at=EXCLUDED.computed_at, core_sha=EXCLUDED.core_sha`,
+								gex_by_strike=EXCLUDED.gex_by_strike, computed_at=EXCLUDED.computed_at, core_sha=EXCLUDED.core_sha
+								WHERE EXCLUDED.collected_at >= ticker_day_summary.collected_at`,
 								tkr, source, rec.Day, rec.CollectedAt, rec.Spot, rec.NetGEX,
 								rec.CallWall, rec.PutWall, rec.GammaFlip, rec.State,
 								rec.ExpiryCount, rec.HorizonDTE, nearExp, rec.NearestMaxPain,
 								rec.MoveLower, rec.MoveUpper, rec.Contracts,
 								rec.CallVolume, rec.PutVolume, rec.CallOI, rec.PutOI,
-								string(expJSON), string(gexJSON), coreSHA,
+								string(expJSON), string(gexJSON), modelVersion,
 							))
 						}
 					}
@@ -1581,30 +1352,34 @@ func (s *DesktopService) deriveGo(ctx context.Context, ticker, source string) er
 		}
 	}
 
+	if latestOnly {
+		return s.applyDerived(ctx, tkr, writes)
+	}
+
 	// 3. Rebuild contract_volume_stats when stale (through_day < lastCompletedTradingDay).
-	lastCompleted := lastCompletedTradingDay(s.now())
+	lastCompleted := marketclock.LastCompletedTradingDay(s.now())
 	var maxThrough sql.NullString
 	if source != "" {
-		_ = s.store.read.QueryRowContext(ctx,
+		_ = s.store.Read().QueryRowContext(ctx,
 			"SELECT max(substr(through_day,1,10)) FROM contract_volume_stats WHERE ticker=? AND source=?",
 			tkr, source).Scan(&maxThrough)
 	} else {
-		_ = s.store.read.QueryRowContext(ctx,
+		_ = s.store.Read().QueryRowContext(ctx,
 			"SELECT max(substr(through_day,1,10)) FROM contract_volume_stats WHERE ticker=?",
 			tkr).Scan(&maxThrough)
 	}
 	if !maxThrough.Valid || maxThrough.String < lastCompleted {
-		todayNY := s.now().In(marketZone).Format("2006-01-02")
-		allDaily, err := s.store.collectionMoments(ctx, tkr, source, unusualHistoryDays, true)
+		todayNY := s.now().In(marketclock.Zone).Format("2006-01-02")
+		allDaily, err := s.store.CollectionMoments(ctx, tkr, source, unusualHistoryDays, true)
 		if err == nil {
 			var priorMoments []string
 			for _, m := range allDaily {
-				if marketDayString(m) < todayNY {
+				if marketclock.MarketDay(m) < todayNY {
 					priorMoments = append(priorMoments, m)
 				}
 			}
 			if len(priorMoments) > 0 {
-				volWrites, err := s.store.computeVolumeStatsWrites(ctx, tkr, source, priorMoments)
+				volWrites, err := s.store.ComputeVolumeStatsWrites(ctx, tkr, source, priorMoments)
 				if err == nil {
 					writes = append(writes, volWrites...)
 				}
@@ -1615,196 +1390,33 @@ func (s *DesktopService) deriveGo(ctx context.Context, ticker, source string) er
 	// 4. Optional realized volatility (when GEX_FETCH_RV=1).
 	if os.Getenv("GEX_FETCH_RV") == "1" {
 		var hasRV int
-		_ = s.store.read.QueryRowContext(ctx,
+		_ = s.store.Read().QueryRowContext(ctx,
 			"SELECT count(*) FROM realized_volatility WHERE ticker=? AND substr(as_of_date,1,10)=?",
 			tkr, lastCompleted).Scan(&hasRV)
 		if hasRV == 0 {
-			if rvWrites, err := s.fetchRVWrites(ctx, tkr, lastCompleted); err == nil {
-				writes = append(writes, rvWrites...)
+			if values, err := s.yahoo.RealizedVolatility(ctx, tkr); err == nil {
+				for _, window := range []int{10, 20, 30} {
+					if value, ok := values[window]; ok {
+						writes = append(writes, newDerivedWrite(`INSERT INTO realized_volatility
+                            (ticker,as_of_date,window_days,value,source) VALUES (?,?,?,?,?)
+                            ON CONFLICT(ticker,as_of_date,window_days) DO UPDATE SET
+                            value=excluded.value,source=excluded.source,fetched_at=CURRENT_TIMESTAMP`,
+							tkr, lastCompleted, window, value, "yahoo"))
+					}
+				}
 			}
 		}
 	}
 
-	return s.store.applyDerived(ctx, writes)
+	return s.applyDerived(ctx, tkr, writes)
 }
 
-type welfordAccum struct {
-	n      int
-	mean   float64
-	m2     float64
-	maxDay string
-}
-
-func (w *welfordAccum) step(v float64, day string) {
-	w.n++
-	delta := v - w.mean
-	w.mean += delta / float64(w.n)
-	w.m2 += delta * (v - w.mean)
-	if day > w.maxDay {
-		w.maxDay = day
+func (s *DesktopService) applyDerived(ctx context.Context, ticker string, writes []store.DerivedWrite) error {
+	if err := s.store.ApplyDerived(ctx, writes); err != nil {
+		return err
 	}
-}
-
-func (s *Store) computeVolumeStatsWrites(ctx context.Context, ticker, source string, moments []string) ([]DerivedWrite, error) {
-	momentsJSON, _ := json.Marshal(moments)
-	where := "ticker = ? AND collected_at IN (SELECT value FROM json_each(?))"
-	args := []any{ticker, string(momentsJSON)}
-	if source != "" {
-		where += " AND source = ?"
-		args = append(args, source)
+	if len(writes) > 0 {
+		s.historyChanged(ticker)
 	}
-	q := fmt.Sprintf(`SELECT COALESCE(source,''), substr(CAST(collected_at AS TEXT),1,10), substr(CAST(expiry AS TEXT),1,10), strike, option_type, volume
-		FROM option_snapshots WHERE %s
-		UNION ALL
-		SELECT COALESCE(source,''), substr(CAST(collected_at AS TEXT),1,10), substr(CAST(expiry AS TEXT),1,10), strike, option_type, volume
-		FROM option_snapshots_archive WHERE %s`, where, where)
-	rows, err := s.read.QueryContext(ctx, q, append(args, args...)...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	type statKey struct {
-		source string
-		expiry string
-		strike float64
-		side   string
-	}
-	accMap := make(map[statKey]*welfordAccum)
-	var order []statKey
-	for rows.Next() {
-		var src, day, exp, side string
-		var strike float64
-		var vol sql.NullFloat64
-		if err := rows.Scan(&src, &day, &exp, &strike, &side, &vol); err != nil {
-			return nil, err
-		}
-		sk := statKey{source: src, expiry: exp, strike: strike, side: side}
-		acc, exists := accMap[sk]
-		if !exists {
-			acc = &welfordAccum{maxDay: day}
-			accMap[sk] = acc
-			order = append(order, sk)
-		} else if day > acc.maxDay {
-			acc.maxDay = day
-		}
-		if vol.Valid && !math.IsNaN(vol.Float64) && !math.IsInf(vol.Float64, 0) {
-			acc.step(vol.Float64, day)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	sqlStmt := `INSERT INTO contract_volume_stats
-		(ticker,source,expiry,strike,option_type,avg_volume,std_volume,history_points,through_day,computed_at)
-		VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
-		ON CONFLICT (ticker,source,expiry,strike,option_type) DO UPDATE SET
-		avg_volume=EXCLUDED.avg_volume, std_volume=EXCLUDED.std_volume,
-		history_points=EXCLUDED.history_points, through_day=EXCLUDED.through_day,
-		computed_at=EXCLUDED.computed_at`
-
-	writes := make([]DerivedWrite, 0, len(order))
-	for _, sk := range order {
-		acc := accMap[sk]
-		var avgPtr, stdPtr *float64
-		if acc.n > 0 {
-			m := acc.mean
-			avgPtr = &m
-		}
-		if acc.n > 1 {
-			sd := math.Sqrt(math.Max(0, acc.m2) / float64(acc.n-1))
-			stdPtr = &sd
-		}
-		writes = append(writes, newDerivedWrite(
-			sqlStmt,
-			ticker, sk.source, sk.expiry, sk.strike, sk.side, avgPtr, stdPtr, acc.n, acc.maxDay,
-		))
-	}
-	return writes, nil
-}
-
-// --- On-demand Python helpers for Yahoo fallback & Realized Volatility ---
-
-func findPythonBin(root string) string {
-	// A distributed app carries its on-demand Yahoo helper runtime with it.
-	bundledPy := filepath.Join(root, "python", "bin", "python3")
-	if _, err := os.Stat(bundledPy); err == nil {
-		return bundledPy
-	}
-	venvPy := filepath.Join(root, ".venv", "bin", "python")
-	if _, err := os.Stat(venvPy); err == nil {
-		return venvPy
-	}
-	return "python3"
-}
-
-func (s *DesktopService) pythonHelperCommand(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, findPythonBin(s.root), args...)
-	cmd.Dir = s.root
-	// Keep the bundle immutable and independent of shell Python configuration.
-	for _, value := range os.Environ() {
-		if !strings.HasPrefix(value, "PYTHONHOME=") && !strings.HasPrefix(value, "PYTHONPATH=") {
-			cmd.Env = append(cmd.Env, value)
-		}
-	}
-	cmd.Env = append(cmd.Env, "PYTHONPATH="+s.root, "PYTHONNOUSERSITE=1", "PYTHONDONTWRITEBYTECODE=1",
-		"GEX_NATIVE_BACKEND=1", "GEX_DB_READONLY=1", "GEX_DATABASE_PATH="+s.store.path)
-	return cmd
-}
-
-func (s *DesktopService) fetchYahooOnDemand(ctx context.Context, ticker string) (Snapshot, error) {
-	var raw []byte
-	var err error
-	if s.pythonURL != "" {
-		raw, err = s.compute(ctx, "/compute/yahoo", map[string]string{"ticker": ticker})
-		if err != nil {
-			return Snapshot{}, err
-		}
-	} else {
-		cmd := s.pythonHelperCommand(ctx, "-m", "app.desktop_compute", "--op=yahoo", "--ticker="+ticker)
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			msg := strings.TrimSpace(stderr.String())
-			if msg == "" {
-				msg = err.Error()
-			}
-			return Snapshot{}, fmt.Errorf("Yahoo 采集失败: %s", msg)
-		}
-		raw = stdout.Bytes()
-	}
-	var response struct {
-		Snapshot
-		Error       string `json:"error"`
-		RateLimited bool   `json:"rate_limited"`
-	}
-	if err := json.Unmarshal(raw, &response); err != nil {
-		return Snapshot{}, err
-	}
-	if response.Error != "" {
-		code := 0
-		if response.RateLimited {
-			code = 429
-		}
-		return response.Snapshot, &ProviderError{Status: code, RetryAfter: 30 * time.Minute, Message: response.Error}
-	}
-	return response.Snapshot, nil
-}
-
-func (s *DesktopService) fetchRVWrites(ctx context.Context, ticker, asOfDay string) ([]DerivedWrite, error) {
-	cmd := s.pythonHelperCommand(ctx, "-m", "app.desktop_compute", "--op=rv", "--ticker="+ticker, "--as-of="+asOfDay)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	if err := cmd.Run(); err != nil {
-		return nil, err
-	}
-	var out struct {
-		Writes []DerivedWrite `json:"writes"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		return nil, err
-	}
-	return out.Writes, nil
+	return nil
 }

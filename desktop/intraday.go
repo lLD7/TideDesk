@@ -7,152 +7,21 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"reflect"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
+
+	"gammagrid.local/desktop/internal/marketclock"
+	"gammagrid.local/desktop/internal/provider"
+	"gammagrid.local/desktop/internal/store"
+	"gammagrid.local/desktop/internal/viewmodel"
 )
-
-type TickerCollectConfig struct {
-	Ticker          string `json:"ticker"`
-	LowFreqEnabled  bool   `json:"low_freq_enabled"`
-	HighFreqEnabled bool   `json:"high_freq_enabled"`
-	HighFreqSec     int    `json:"high_freq_sec"`
-}
-
-type IntradayBar struct {
-	Time           string  `json:"time"`
-	WindowLabel    string  `json:"window_label"`
-	Spot           float64 `json:"spot"`
-	CallVol        float64 `json:"call_vol"`
-	PutVol         float64 `json:"put_vol"`
-	TotalVol       float64 `json:"total_vol"`
-	PCRatio        float64 `json:"pc_ratio"`
-	CallPrem       float64 `json:"call_prem"`
-	PutPrem        float64 `json:"put_prem"`
-	TotalPrem      float64 `json:"total_prem"`
-	NetPrem        float64 `json:"net_prem"`
-	WeeklyCallPrem float64 `json:"weekly_call_prem"`
-	WeeklyPutPrem  float64 `json:"weekly_put_prem"`
-	WeeklyNetPrem  float64 `json:"weekly_net_prem"`
-	CumWeeklyCall  float64 `json:"cum_weekly_call"`
-	CumWeeklyPut   float64 `json:"cum_weekly_put"`
-	CumWeeklyNet   float64 `json:"cum_weekly_net"`
-	WeeklyNetGEX   float64 `json:"weekly_net_gex"`
-	IsBaseline     bool    `json:"is_baseline"`
-}
-
-type IntradaySummary struct {
-	DateLabel         string        `json:"date_label"`
-	TotalVol          float64       `json:"total_vol"`
-	TotalVolStr       string        `json:"total_vol_str"`
-	TotalPrem         float64       `json:"total_prem"`
-	TotalPremStr      string        `json:"total_prem_str"`
-	NetPrem           float64       `json:"net_prem"`
-	NetPremStr        string        `json:"net_prem_str"`
-	PutVol            float64       `json:"put_vol"`
-	PutVolStr         string        `json:"put_vol_str"`
-	PutPrem           float64       `json:"put_prem"`
-	PutPremStr        string        `json:"put_prem_str"`
-	CallVol           float64       `json:"call_vol"`
-	CallVolStr        string        `json:"call_vol_str"`
-	CallPrem          float64       `json:"call_prem"`
-	CallPremStr       string        `json:"call_prem_str"`
-	WeeklyScope       string        `json:"weekly_scope"`
-	WeeklyCallPremStr string        `json:"weekly_call_prem_str"`
-	WeeklyPutPremStr  string        `json:"weekly_put_prem_str"`
-	WeeklyNetPrem     float64       `json:"weekly_net_prem"`
-	WeeklyNetPremStr  string        `json:"weekly_net_prem_str"`
-	WeeklyNetGEX      float64       `json:"weekly_net_gex"`
-	WeeklyNetGEXStr   string        `json:"weekly_net_gex_str"`
-	TimeBars          []IntradayBar `json:"time_bars"`
-	StrikeBars        []IntradayBar `json:"strike_bars"`
-}
 
 type intradayBaseline struct {
 	tradingDay string
-	volumes    map[string]float64
-}
-
-func normalizeHighFreqSec(sec int) int {
-	switch sec {
-	case 60, 120, 180, 300, 600:
-		return sec
-	default:
-		if sec <= 0 {
-			return 60
-		}
-		if sec < 90 {
-			return 60
-		}
-		if sec < 150 {
-			return 120
-		}
-		if sec < 240 {
-			return 180
-		}
-		if sec < 450 {
-			return 300
-		}
-		return 600
-	}
-}
-
-func (s *Store) tickerCollectConfig(ctx context.Context, ticker string) (TickerCollectConfig, error) {
-	tkr := strings.ToUpper(strings.TrimSpace(ticker))
-	cfg := TickerCollectConfig{
-		Ticker:          tkr,
-		LowFreqEnabled:  true,
-		HighFreqEnabled: false,
-		HighFreqSec:     60,
-	}
-	lowDis, err := s.setting(ctx, "low_freq_disabled:"+tkr)
-	if err != nil {
-		return cfg, err
-	}
-	if lowDis == "1" {
-		cfg.LowFreqEnabled = false
-	}
-	hfEn, err := s.setting(ctx, "high_freq_enabled:"+tkr)
-	if err != nil {
-		return cfg, err
-	}
-	if hfEn == "1" {
-		cfg.HighFreqEnabled = true
-	}
-	hfSecRaw, err := s.setting(ctx, "high_freq_sec:"+tkr)
-	if err != nil {
-		return cfg, err
-	}
-	if sec, err := strconv.Atoi(hfSecRaw); err == nil && sec > 0 {
-		cfg.HighFreqSec = normalizeHighFreqSec(sec)
-	}
-	return cfg, nil
-}
-
-func (s *Store) saveTickerCollectConfig(ctx context.Context, cfg TickerCollectConfig) error {
-	tkr, err := normalizeSymbol(cfg.Ticker)
-	if err != nil {
-		return err
-	}
-	sec := normalizeHighFreqSec(cfg.HighFreqSec)
-	lowDisVal := "0"
-	if !cfg.LowFreqEnabled {
-		lowDisVal = "1"
-	}
-	hfEnVal := "0"
-	if cfg.HighFreqEnabled {
-		hfEnVal = "1"
-	}
-	return s.transaction(ctx, func(tx *sql.Tx) error {
-		if err := setSetting(tx, "low_freq_disabled:"+tkr, lowDisVal); err != nil {
-			return err
-		}
-		if err := setSetting(tx, "high_freq_enabled:"+tkr, hfEnVal); err != nil {
-			return err
-		}
-		return setSetting(tx, "high_freq_sec:"+tkr, strconv.Itoa(sec))
-	})
+	source     string
+	volumes    map[store.ContractID]float64
 }
 
 func optionMidPrice(last, bid, ask *float64) float64 {
@@ -230,7 +99,7 @@ func fmtVolCompact(v float64) string {
 	}
 }
 
-func weeklyExpirySetFromRows(rows []StoredOptionRow, refMoment string) (map[string]bool, string) {
+func weeklyExpirySetFromRows(rows []store.StoredOptionRow, refMoment string) (map[string]bool, string) {
 	expDTE := make(map[string]int)
 	for i := range rows {
 		exp := rows[i].Expiry
@@ -239,7 +108,7 @@ func weeklyExpirySetFromRows(rows []StoredOptionRow, refMoment string) (map[stri
 		}
 		if _, seen := expDTE[exp]; !seen {
 			if yearsToExpiry(exp, refMoment) > 0 {
-				expDTE[exp] = calcDTE(exp, refMoment)
+				expDTE[exp] = viewmodel.CalcDTE(exp, refMoment)
 			}
 		}
 	}
@@ -265,12 +134,12 @@ func weeklyExpirySetFromRows(rows []StoredOptionRow, refMoment string) (map[stri
 	return weeklySet, "0–7 DTE"
 }
 
-func storedRowsFromSnapshot(ticker, source string, at time.Time, snap Snapshot) []StoredOptionRow {
-	dedup := dedupOptions(ticker, snap.Rows)
-	when := stamp(at)
-	out := make([]StoredOptionRow, 0, len(dedup))
+func storedRowsFromSnapshot(ticker, source string, at time.Time, snap provider.Snapshot) []store.StoredOptionRow {
+	dedup := store.DedupOptions(ticker, snap.Rows)
+	when := marketclock.Stamp(at)
+	out := make([]store.StoredOptionRow, 0, len(dedup))
 	for _, r := range dedup {
-		out = append(out, StoredOptionRow{
+		out = append(out, store.StoredOptionRow{
 			Ticker:          ticker,
 			CollectedAt:     when,
 			UnderlyingPrice: snap.Spot,
@@ -298,58 +167,48 @@ func storedRowsFromSnapshot(ticker, source string, at time.Time, snap Snapshot) 
 }
 
 // recordIntradayBar computes contract volume/premium deltas and records a compact bar into intraday_tide_bars.
-func (s *DesktopService) recordIntradayBar(ctx context.Context, ticker, source string, at time.Time, snap Snapshot) error {
+func (s *DesktopService) recordIntradayBar(ctx context.Context, ticker, source string, at time.Time, snap provider.Snapshot, keepLive bool) error {
 	tkr := strings.ToUpper(strings.TrimSpace(ticker))
-	storedRows := storedRowsFromSnapshot(tkr, source, at, snap)
+	var storedRows []store.StoredOptionRow
+	if keepLive {
+		storedRows = storedRowsFromSnapshot(tkr, source, at, snap)
+		if err := solveSnapshotIV(ctx, storedRows); err != nil {
+			return err
+		}
+	} else {
+		snapshot, err := s.snapshot(ctx, store.SnapshotMeta{Ticker: tkr, Source: source, At: marketclock.Stamp(at)})
+		if err != nil {
+			return err
+		}
+		storedRows = snapshot.rows
+	}
 	if len(storedRows) == 0 || snap.Spot <= 0 {
 		return nil
 	}
-	withSolvedIV(storedRows, defaultRiskFreeRate, 0.0)
 
-	// Keep the latest snapshot in memory so live high-frequency updates are immediately reflected in views.
+	tradingDay := at.In(marketclock.Zone).Format("2006-01-02")
+	bucketTime := at.In(marketclock.Zone).Format("15:04")
 	s.intradayMu.Lock()
-	if s.liveSnapshots == nil {
-		s.liveSnapshots = make(map[string][]StoredOptionRow)
-	}
-	s.liveSnapshots[tkr] = storedRows
-	if s.intradayBase == nil {
-		s.intradayBase = make(map[string]*intradayBaseline)
-	}
-	tradingDay := at.In(marketZone).Format("2006-01-02")
-	bucketTime := at.In(marketZone).Format("15:04")
 	base := s.intradayBase[tkr]
 	s.intradayMu.Unlock()
-
-	// If in-memory baseline is missing for today, try seeding from the latest snapshot of today in SQLite.
-	if base == nil || base.tradingDay != tradingDay {
-		seeded := s.seedBaselineFromDB(ctx, tkr, source, tradingDay, stamp(at))
-		s.intradayMu.Lock()
-		if s.intradayBase[tkr] == nil || s.intradayBase[tkr].tradingDay != tradingDay {
-			s.intradayBase[tkr] = seeded
-		}
-		base = s.intradayBase[tkr]
-		s.intradayMu.Unlock()
+	if base == nil || base.tradingDay != tradingDay || base.source != source {
+		base = s.seedBaselineFromDB(ctx, tkr, source, tradingDay, marketclock.Stamp(at))
 	}
+	if base == nil {
+		base = &intradayBaseline{tradingDay: tradingDay, source: source, volumes: make(map[store.ContractID]float64, len(storedRows))}
+	}
+	hasPrior := len(base.volumes) > 0
+	updates := make(map[store.ContractID]float64)
 
-	whenStr := stamp(at)
+	whenStr := marketclock.Stamp(at)
 	weeklySet, _ := weeklyExpirySetFromRows(storedRows, whenStr)
 
 	var (
-		totCallVol, totPutVol, totCallPrem, totPutPrem             float64
-		totWCallPrem, totWPutPrem, weeklyNetGEX                    float64
-		deltaCallVol, deltaPutVol, deltaCallPrem, deltaPutPrem     float64
-		deltaWCallPrem, deltaWPutPrem                              float64
+		totCallVol, totPutVol, totCallPrem, totPutPrem         float64
+		totWCallPrem, totWPutPrem, weeklyNetGEX                float64
+		deltaCallVol, deltaPutVol, deltaCallPrem, deltaPutPrem float64
+		deltaWCallPrem, deltaWPutPrem                          float64
 	)
-
-	s.intradayMu.Lock()
-	hasPrior := base != nil && base.tradingDay == tradingDay && len(base.volumes) > 0
-	if base == nil || base.tradingDay != tradingDay {
-		base = &intradayBaseline{
-			tradingDay: tradingDay,
-			volumes:    make(map[string]float64, len(storedRows)),
-		}
-		s.intradayBase[tkr] = base
-	}
 
 	for i := range storedRows {
 		r := &storedRows[i]
@@ -380,7 +239,7 @@ func (s *DesktopService) recordIntradayBar(ctx context.Context, ticker, source s
 			}
 		}
 
-		idKey := fmt.Sprintf("%s/%g/%s", exp, r.Strike, r.OptionType)
+		idKey := store.ContractID{Expiry: exp, Strike: r.Strike, Side: r.OptionType}
 		if hasPrior {
 			prev := base.volumes[idKey]
 			dv := math.Max(0, vol-prev)
@@ -399,13 +258,12 @@ func (s *DesktopService) recordIntradayBar(ctx context.Context, ticker, source s
 				}
 			}
 			if vol > prev {
-				base.volumes[idKey] = vol
+				updates[idKey] = vol
 			}
 		} else {
-			base.volumes[idKey] = vol
+			updates[idKey] = vol
 		}
 	}
-	s.intradayMu.Unlock()
 
 	useDelta := hasPrior && (deltaCallVol+deltaPutVol > 0)
 	isBaseline := 1
@@ -421,7 +279,7 @@ func (s *DesktopService) recordIntradayBar(ctx context.Context, ticker, source s
 	netPrem := cPrem - pPrem
 	wNetPrem := wcPrem - wpPrem
 
-	return s.store.transaction(ctx, func(tx *sql.Tx) error {
+	err := s.store.Transaction(ctx, func(tx *sql.Tx) error {
 		if isBaseline == 0 {
 			_, err := tx.ExecContext(ctx, `
 				INSERT INTO intraday_tide_bars (
@@ -460,28 +318,58 @@ func (s *DesktopService) recordIntradayBar(ctx context.Context, ticker, source s
 			wcPrem, wpPrem, wNetPrem, weeklyNetGEX)
 		return err
 	})
+	if err != nil {
+		return err
+	}
+	for key, volume := range updates {
+		base.volumes[key] = volume
+	}
+	s.intradayMu.Lock()
+	if s.intradayBase == nil {
+		s.intradayBase = make(map[string]*intradayBaseline)
+	}
+	s.intradayBase[tkr] = base
+	s.intradayMu.Unlock()
+	if keepLive {
+		s.publishLive(tkr, storedRows)
+	} else {
+		s.intradayMu.Lock()
+		s.dropLive(tkr)
+		s.intradayMu.Unlock()
+	}
+	s.intradayMu.Lock()
+	s.barVersion[tkr]++
+	s.intradayMu.Unlock()
+	return nil
 }
 
 func (s *DesktopService) seedBaselineFromDB(ctx context.Context, ticker, source, tradingDay, beforeStamp string) *intradayBaseline {
-	moment, rows, err := s.store.latestSnapshot(ctx, ticker, source)
-	if err != nil || len(rows) == 0 || moment == "" {
+	var moment string
+	err := s.store.Read().QueryRowContext(ctx, `SELECT COALESCE(MAX(at),'') FROM (
+		SELECT CAST(MAX(collected_at) AS TEXT) AS at FROM option_snapshots WHERE ticker=? AND source=? AND collected_at<?
+		UNION ALL
+		SELECT CAST(MAX(collected_at) AS TEXT) FROM option_snapshots_archive WHERE ticker=? AND source=? AND collected_at<?
+	)`, ticker, source, beforeStamp, ticker, source, beforeStamp).Scan(&moment)
+	if err != nil || moment == "" || marketclock.MarketDay(moment) != tradingDay {
 		return nil
 	}
-	if marketDayString(moment) != tradingDay {
+	rows, err := s.store.SnapshotsAt(ctx, ticker, source, []string{moment})
+	if err != nil || len(rows) == 0 {
 		return nil
 	}
-	vols := make(map[string]float64, len(rows))
+	vols := make(map[store.ContractID]float64, len(rows))
 	for i := range rows {
 		r := &rows[i]
 		exp := r.Expiry
 		if len(exp) >= 10 {
 			exp = exp[:10]
 		}
-		idKey := fmt.Sprintf("%s/%g/%s", exp, r.Strike, r.OptionType)
+		idKey := store.ContractID{Expiry: exp, Strike: r.Strike, Side: r.OptionType}
 		vols[idKey] = valOrZero(r.Volume)
 	}
 	return &intradayBaseline{
 		tradingDay: tradingDay,
+		source:     source,
 		volumes:    vols,
 	}
 }
@@ -489,14 +377,22 @@ func (s *DesktopService) seedBaselineFromDB(ctx context.Context, ticker, source,
 // collectHighFreqTick fetches the current chain for a single ticker and records a lightweight
 // intraday bar in intraday_tide_bars without bloating option_snapshots with duplicate full chains.
 func (s *DesktopService) collectHighFreqTick(ctx context.Context, ticker string) error {
+	defer s.wakeScheduler()
 	if !s.collectMu.TryLock() {
-		return nil
+		return fmt.Errorf("已有采集任务在进行，请等待完成")
 	}
 	defer s.collectMu.Unlock()
+	return s.collectHighFreqLocked(ctx, ticker)
+}
 
-	tkr, err := normalizeSymbol(ticker)
-	if err != nil || tkr == "VIX" || tkr == "VIXW" {
+func (s *DesktopService) collectHighFreqLocked(ctx context.Context, ticker string) error {
+
+	tkr, err := provider.NormalizeSymbol(ticker)
+	if err != nil {
 		return err
+	}
+	if tkr == "VIX" || tkr == "VIXW" {
+		return fmt.Errorf("暂不支持 VIX 期权")
 	}
 
 	candidates := []string{"cboe", "yahoo"}
@@ -508,29 +404,32 @@ func (s *DesktopService) collectHighFreqTick(ctx context.Context, ticker string)
 	}
 
 	for _, src := range candidates {
-		raw, err := s.store.setting(ctx, "provider_cooldown_until:"+src)
+		raw, err := s.store.Setting(ctx, "provider_cooldown_until:"+src)
 		if err != nil {
 			continue
 		}
-		if until, err := parseStamp(raw); err == nil && until.After(s.now()) {
+		if until, err := marketclock.ParseStamp(raw); err == nil && until.After(s.now()) {
 			continue
 		}
 		at := s.now()
-		var snap Snapshot
+		var snap provider.Snapshot
 		if src == "cboe" {
 			snap, err = s.fetch(ctx, tkr)
 		} else {
-			snap, err = s.fetchYahooOnDemand(ctx, tkr)
+			snap, err = s.fetchYahoo(ctx, tkr)
 		}
 		if err != nil || len(snap.Rows) == 0 || snap.Spot <= 0 {
-			var pe *ProviderError
+			var pe *provider.ProviderError
 			if errors.As(err, &pe) && pe.Status == 429 {
-				_ = s.store.setSetting(ctx, "provider_cooldown_until:"+src, stamp(s.now().Add(max(pe.RetryAfter, 30*time.Minute))))
+				_ = s.store.SetSetting(ctx, "provider_cooldown_until:"+src, marketclock.Stamp(s.now().Add(max(pe.RetryAfter, 30*time.Minute))))
 			}
 			continue
 		}
 		// If the database has no snapshot at all for this ticker yet, store one baseline snapshot.
-		existingMoment, _ := s.store.latestMoment(ctx, tkr, "")
+		existingMoment, err := s.store.LatestMoment(ctx, tkr, "")
+		if err != nil {
+			return err
+		}
 		if existingMoment == "" {
 			zero := 0.0
 			for _, row := range snap.Rows {
@@ -539,27 +438,24 @@ func (s *DesktopService) collectHighFreqTick(ctx context.Context, ticker string)
 				}
 			}
 			zero /= float64(len(snap.Rows))
-			_ = s.store.saveSnapshot(ctx, tkr, src, at, snap, zero)
+			if err := s.store.SaveSnapshot(ctx, tkr, src, at, snap, zero); err != nil {
+				return err
+			}
 		}
-		if err := s.recordIntradayBar(ctx, tkr, src, at, snap); err != nil {
+		if err := s.recordIntradayBar(ctx, tkr, src, at, snap, existingMoment != ""); err != nil {
 			return err
 		}
-		s.intradayMu.Lock()
-		if s.lastHighFreqAt == nil {
-			s.lastHighFreqAt = make(map[string]time.Time)
-		}
-		s.lastHighFreqAt[tkr] = at
-		s.intradayMu.Unlock()
+		s.markSampled(tkr, s.now())
 		return nil
 	}
 	return fmt.Errorf("高频抓取未获取到 %s 的有效数据", tkr)
 }
 
-func (s *DesktopService) buildIntradaySummary(ctx context.Context, ticker, source, chosenMoment string, snapshotRows []StoredOptionRow) IntradaySummary {
+func (s *DesktopService) buildIntradaySummary(ctx context.Context, ticker, source, chosenMoment string, snapshotRows []store.StoredOptionRow) viewmodel.IntradaySummary {
 	if len(snapshotRows) == 0 {
-		return IntradaySummary{
-			TimeBars:   []IntradayBar{},
-			StrikeBars: []IntradayBar{},
+		return viewmodel.IntradaySummary{
+			TimeBars:   []viewmodel.IntradayBar{},
+			StrikeBars: []viewmodel.IntradayBar{},
 		}
 	}
 	spot := snapshotRows[0].UnderlyingPrice
@@ -603,15 +499,15 @@ func (s *DesktopService) buildIntradaySummary(ctx context.Context, ticker, sourc
 	netPrem := callPrem - putPrem
 	wNetPrem := wCallPrem - wPutPrem
 
-	dateLabel := marketDayString(chosenMoment)
-	if t, ok := parseAnyTime(chosenMoment); ok {
-		dateLabel = t.In(marketZone).Format("01/02/2006")
+	dateLabel := marketclock.MarketDay(chosenMoment)
+	if t, ok := marketclock.ParseTime(chosenMoment); ok {
+		dateLabel = t.In(marketclock.Zone).Format("01/02/2006")
 	}
 
 	timeBars := s.loadOrSynthesizeTimeBars(ctx, ticker, source, chosenMoment, snapshotRows, weeklySet)
 	strikeBars := buildStrikeFlowBars(snapshotRows, spot, weeklySet)
 
-	return IntradaySummary{
+	return viewmodel.IntradaySummary{
 		DateLabel:         dateLabel,
 		TotalVol:          totVol,
 		TotalVolStr:       fmtVolCompact(totVol),
@@ -639,10 +535,10 @@ func (s *DesktopService) buildIntradaySummary(ctx context.Context, ticker, sourc
 	}
 }
 
-func (s *DesktopService) loadOrSynthesizeTimeBars(ctx context.Context, ticker, source, chosenMoment string, latestRows []StoredOptionRow, weeklySet map[string]bool) []IntradayBar {
+func (s *DesktopService) loadOrSynthesizeTimeBars(ctx context.Context, ticker, source, chosenMoment string, latestRows []store.StoredOptionRow, weeklySet map[string]bool) []viewmodel.IntradayBar {
 	tkr := strings.ToUpper(strings.TrimSpace(ticker))
-	tradingDay := marketDayString(chosenMoment)
-	rows, err := s.store.read.QueryContext(ctx, `
+	tradingDay := marketclock.MarketDay(chosenMoment)
+	rows, err := s.store.Read().QueryContext(ctx, `
 		SELECT bucket_time, spot, call_vol, put_vol, call_prem, put_prem, net_prem,
 		       weekly_call_prem, weekly_put_prem, weekly_net_prem, weekly_net_gex, is_baseline
 		FROM intraday_tide_bars
@@ -650,11 +546,11 @@ func (s *DesktopService) loadOrSynthesizeTimeBars(ctx context.Context, ticker, s
 		ORDER BY bucket_time ASC
 	`, tkr, source, source, tradingDay)
 
-	var dbBars []IntradayBar
+	var dbBars []viewmodel.IntradayBar
 	hasDeltaBar := false
 	if err == nil {
 		for rows.Next() {
-			var b IntradayBar
+			var b viewmodel.IntradayBar
 			var isBase int
 			if scanErr := rows.Scan(
 				&b.Time, &b.Spot, &b.CallVol, &b.PutVol, &b.CallPrem, &b.PutPrem, &b.NetPrem,
@@ -679,7 +575,7 @@ func (s *DesktopService) loadOrSynthesizeTimeBars(ctx context.Context, ticker, s
 	// If we have real delta bars from high-frequency polling on this trading day, filter out the initial
 	// cumulative baseline bar so the candle volume Y-axis stays on a uniform per-interval scale.
 	if hasDeltaBar {
-		filtered := make([]IntradayBar, 0, len(dbBars))
+		filtered := make([]viewmodel.IntradayBar, 0, len(dbBars))
 		for _, b := range dbBars {
 			if !b.IsBaseline {
 				filtered = append(filtered, b)
@@ -696,7 +592,7 @@ func (s *DesktopService) loadOrSynthesizeTimeBars(ctx context.Context, ticker, s
 	}
 
 	// Fallback: derive time bars from historical snapshots in option_snapshots (up to last 16 snapshots).
-	moments, err := s.store.collectionMoments(ctx, tkr, source, 14, false)
+	moments, err := s.store.CollectionMoments(ctx, tkr, source, 14, false)
 	if err == nil && len(moments) > 0 {
 		if len(moments) > 16 {
 			moments = moments[:16]
@@ -706,125 +602,122 @@ func (s *DesktopService) loadOrSynthesizeTimeBars(ctx context.Context, ticker, s
 		for i := range moments {
 			chron[i] = moments[len(moments)-1-i]
 		}
-		allSnaps, snapErr := s.store.snapshotsAt(ctx, tkr, source, chron)
-		if snapErr == nil && len(allSnaps) > 0 {
-			byMoment := make(map[string][]StoredOptionRow, len(chron))
-			for i := range allSnaps {
-				m := allSnaps[i].CollectedAt
-				byMoment[m] = append(byMoment[m], allSnaps[i])
+		var synth []viewmodel.IntradayBar
+		var prevDay string
+		var prevVols map[store.ContractID]float64
+		for _, m := range chron {
+			if ctx.Err() != nil {
+				return nil
 			}
-			var synth []IntradayBar
-			var prevDay string
-			var prevVols map[string]float64
-			for _, m := range chron {
-				mRows := byMoment[m]
-				if len(mRows) == 0 {
-					continue
+			mRows, err := s.store.SnapshotsAt(ctx, tkr, source, []string{m})
+			if err != nil || len(mRows) == 0 {
+				continue
+			}
+			if solveSnapshotIV(ctx, mRows) != nil {
+				return nil
+			}
+			day := marketclock.MarketDay(m)
+			wSet, _ := weeklyExpirySetFromRows(mRows, m)
+			curVols := make(map[store.ContractID]float64, len(mRows))
+			var (
+				cVol, pVol, cPrem, pPrem, wcPrem, wpPrem, wGEX float64
+				dCVol, dPVol, dCPrem, dPPrem, dWCPrem, dWPPrem float64
+			)
+			sameDayPrior := prevDay == day && len(prevVols) > 0
+			for i := range mRows {
+				r := &mRows[i]
+				v := valOrZero(r.Volume)
+				mid := optionMidPrice(r.LastPrice, r.Bid, r.Ask)
+				prem := v * mid * 100.0
+				exp := r.Expiry
+				if len(exp) >= 10 {
+					exp = exp[:10]
 				}
-				withSolvedIV(mRows, defaultRiskFreeRate, 0.0)
-				day := marketDayString(m)
-				wSet, _ := weeklyExpirySetFromRows(mRows, m)
-				curVols := make(map[string]float64, len(mRows))
-				var (
-					cVol, pVol, cPrem, pPrem, wcPrem, wpPrem, wGEX float64
-					dCVol, dPVol, dCPrem, dPPrem, dWCPrem, dWPPrem float64
-				)
-				sameDayPrior := prevDay == day && len(prevVols) > 0
-				for i := range mRows {
-					r := &mRows[i]
-					v := valOrZero(r.Volume)
-					mid := optionMidPrice(r.LastPrice, r.Bid, r.Ask)
-					prem := v * mid * 100.0
-					exp := r.Expiry
-					if len(exp) >= 10 {
-						exp = exp[:10]
+				isW := wSet[exp]
+				if isW {
+					if gex, ok := rowExposure(r, "gex", defaultRiskFreeRate, 0.0); ok && !math.IsNaN(gex) {
+						wGEX += gex
 					}
-					isW := wSet[exp]
+				}
+				if r.OptionType == "call" {
+					cVol += v
+					cPrem += prem
 					if isW {
-						if gex, ok := rowExposure(r, "gex", defaultRiskFreeRate, 0.0); ok && !math.IsNaN(gex) {
-							wGEX += gex
-						}
+						wcPrem += prem
 					}
+				} else if r.OptionType == "put" {
+					pVol += v
+					pPrem += prem
+					if isW {
+						wpPrem += prem
+					}
+				}
+				idKey := store.ContractID{Expiry: exp, Strike: r.Strike, Side: r.OptionType}
+				curVols[idKey] = v
+				if sameDayPrior {
+					dv := math.Max(0, v-prevVols[idKey])
+					dp := dv * mid * 100.0
 					if r.OptionType == "call" {
-						cVol += v
-						cPrem += prem
+						dCVol += dv
+						dCPrem += dp
 						if isW {
-							wcPrem += prem
+							dWCPrem += dp
 						}
 					} else if r.OptionType == "put" {
-						pVol += v
-						pPrem += prem
+						dPVol += dv
+						dPPrem += dp
 						if isW {
-							wpPrem += prem
-						}
-					}
-					idKey := fmt.Sprintf("%s/%g/%s", exp, r.Strike, r.OptionType)
-					curVols[idKey] = v
-					if sameDayPrior {
-						dv := math.Max(0, v-prevVols[idKey])
-						dp := dv * mid * 100.0
-						if r.OptionType == "call" {
-							dCVol += dv
-							dCPrem += dp
-							if isW {
-								dWCPrem += dp
-							}
-						} else if r.OptionType == "put" {
-							dPVol += dv
-							dPPrem += dp
-							if isW {
-								dWPPrem += dp
-							}
+							dWPPrem += dp
 						}
 					}
 				}
-				useDiff := sameDayPrior && (dCVol+dPVol > 0)
-				if useDiff {
-					cVol, pVol = dCVol, dPVol
-					cPrem, pPrem = dCPrem, dPPrem
-					wcPrem, wpPrem = dWCPrem, dWPPrem
-				}
-				prevDay = day
-				prevVols = curVols
+			}
+			useDiff := sameDayPrior && (dCVol+dPVol > 0)
+			if useDiff {
+				cVol, pVol = dCVol, dPVol
+				cPrem, pPrem = dCPrem, dPPrem
+				wcPrem, wpPrem = dWCPrem, dWPPrem
+			}
+			prevDay = day
+			prevVols = curVols
 
-				lbl := fmtTimeMMDDHHMM(m)
-				winLbl := m
-				if t, ok := parseAnyTime(m); ok {
-					et := t.In(marketZone)
-					if len(chron) <= 6 {
-						lbl = et.Format("01-02 15:04")
-					} else {
-						lbl = et.Format("15:04")
-					}
-					winLbl = et.Format("01/02/2006 15:04 MST")
+			lbl := fmtTimeMMDDHHMM(m)
+			winLbl := m
+			if t, ok := marketclock.ParseTime(m); ok {
+				et := t.In(marketclock.Zone)
+				if len(chron) <= 6 {
+					lbl = et.Format("01-02 15:04")
+				} else {
+					lbl = et.Format("15:04")
 				}
-				pc := 0.0
-				if cVol > 0 {
-					pc = pVol / cVol
-				}
-				synth = append(synth, IntradayBar{
-					Time:           lbl,
-					WindowLabel:    winLbl,
-					Spot:           mRows[0].UnderlyingPrice,
-					CallVol:        cVol,
-					PutVol:         pVol,
-					TotalVol:       cVol + pVol,
-					PCRatio:        pc,
-					CallPrem:       cPrem,
-					PutPrem:        pPrem,
-					TotalPrem:      cPrem + pPrem,
-					NetPrem:        cPrem - pPrem,
-					WeeklyCallPrem: wcPrem,
-					WeeklyPutPrem:  wpPrem,
-					WeeklyNetPrem:  wcPrem - wpPrem,
-					WeeklyNetGEX:   wGEX,
-					IsBaseline:     !useDiff,
-				})
+				winLbl = et.Format("01/02/2006 15:04 MST")
 			}
-			if len(synth) > 0 {
-				populateCumulativeWeekly(synth)
-				return synth
+			pc := 0.0
+			if cVol > 0 {
+				pc = pVol / cVol
 			}
+			synth = append(synth, viewmodel.IntradayBar{
+				Time:           lbl,
+				WindowLabel:    winLbl,
+				Spot:           mRows[0].UnderlyingPrice,
+				CallVol:        cVol,
+				PutVol:         pVol,
+				TotalVol:       cVol + pVol,
+				PCRatio:        pc,
+				CallPrem:       cPrem,
+				PutPrem:        pPrem,
+				TotalPrem:      cPrem + pPrem,
+				NetPrem:        cPrem - pPrem,
+				WeeklyCallPrem: wcPrem,
+				WeeklyPutPrem:  wpPrem,
+				WeeklyNetPrem:  wcPrem - wpPrem,
+				WeeklyNetGEX:   wGEX,
+				IsBaseline:     !useDiff,
+			})
+		}
+		if len(synth) > 0 {
+			populateCumulativeWeekly(synth)
+			return synth
 		}
 	}
 
@@ -832,10 +725,10 @@ func (s *DesktopService) loadOrSynthesizeTimeBars(ctx context.Context, ticker, s
 		populateCumulativeWeekly(dbBars)
 		return dbBars
 	}
-	return []IntradayBar{}
+	return []viewmodel.IntradayBar{}
 }
 
-func populateCumulativeWeekly(bars []IntradayBar) {
+func populateCumulativeWeekly(bars []viewmodel.IntradayBar) {
 	var cumC, cumP, cumNet float64
 	for i := range bars {
 		cumC += bars[i].WeeklyCallPrem
@@ -847,11 +740,11 @@ func populateCumulativeWeekly(bars []IntradayBar) {
 	}
 }
 
-func buildStrikeFlowBars(rows []StoredOptionRow, spot float64, weeklySet map[string]bool) []IntradayBar {
+func buildStrikeFlowBars(rows []store.StoredOptionRow, spot float64, weeklySet map[string]bool) []viewmodel.IntradayBar {
 	type strikeAcc struct {
-		strike                         float64
-		cVol, pVol, cPrem, pPrem       float64
-		wCPrem, wPPrem, wGEX           float64
+		strike                   float64
+		cVol, pVol, cPrem, pPrem float64
+		wCPrem, wPPrem, wGEX     float64
 	}
 	byStrike := make(map[float64]*strikeAcc)
 	for i := range rows {
@@ -896,7 +789,7 @@ func buildStrikeFlowBars(rows []StoredOptionRow, spot float64, weeklySet map[str
 	}
 	sort.Float64s(strikes)
 	if len(strikes) == 0 {
-		return []IntradayBar{}
+		return []viewmodel.IntradayBar{}
 	}
 
 	// Band around ATM up to 32 strikes so the bar chart has high density and clear readability.
@@ -913,15 +806,15 @@ func buildStrikeFlowBars(rows []StoredOptionRow, spot float64, weeklySet map[str
 	hi := min(len(strikes), atmIdx+half+1)
 	banded := strikes[lo:hi]
 
-	out := make([]IntradayBar, 0, len(banded))
+	out := make([]viewmodel.IntradayBar, 0, len(banded))
 	for _, k := range banded {
 		acc := byStrike[k]
 		pc := 0.0
 		if acc.cVol > 0 {
 			pc = acc.pVol / acc.cVol
 		}
-		sLbl := fmtStrikeVal(k)
-		out = append(out, IntradayBar{
+		sLbl := viewmodel.FmtStrikeVal(k)
+		out = append(out, viewmodel.IntradayBar{
 			Time:           sLbl,
 			WindowLabel:    fmt.Sprintf("行权价 K = $%s (现价 $%.2f)", sLbl, spot),
 			Spot:           spot,
@@ -941,4 +834,69 @@ func buildStrikeFlowBars(rows []StoredOptionRow, spot float64, weeklySet map[str
 	}
 	populateCumulativeWeekly(out)
 	return out
+}
+
+func (s *DesktopService) markSampled(ticker string, now time.Time) {
+	s.intradayMu.Lock()
+	defer s.intradayMu.Unlock()
+	s.lastHighFreqAt[ticker] = now
+	delete(s.highFreqRetry, ticker)
+}
+
+func (s *DesktopService) publishLive(ticker string, rows []store.StoredOptionRow) {
+	size := liveSnapshotBytes(rows)
+	s.intradayMu.Lock()
+	defer s.intradayMu.Unlock()
+	s.dropLive(ticker)
+	// Keep live market data within a separate budget from cached page results.
+	for size <= cacheBudget && s.liveBytes+size > cacheBudget {
+		var oldest string
+		for symbol, candidate := range s.liveSnapshots {
+			if oldest == "" || candidate[0].CollectedAt < s.liveSnapshots[oldest][0].CollectedAt {
+				oldest = symbol
+			}
+		}
+		s.dropLive(oldest)
+	}
+	if size <= cacheBudget {
+		s.liveSnapshots[ticker] = rows
+		s.liveSizes[ticker] = size
+		s.liveBytes += size
+	}
+}
+
+func liveSnapshotBytes(rows []store.StoredOptionRow) int {
+	return int(reflect.TypeOf(rows).Size()) + retainedBytes(reflect.ValueOf(rows))
+}
+
+// dropLive is called with intradayMu held.
+func (s *DesktopService) dropLive(ticker string) {
+	s.liveBytes -= s.liveSizes[ticker]
+	delete(s.liveSizes, ticker)
+	delete(s.liveSnapshots, ticker)
+}
+
+func (s *DesktopService) cleanupIntraday(day string, tickers map[string]store.TickerCollectConfig) {
+	s.intradayMu.Lock()
+	defer s.intradayMu.Unlock()
+	for ticker, base := range s.intradayBase {
+		if _, watched := tickers[ticker]; !watched || base == nil || base.tradingDay != day {
+			delete(s.intradayBase, ticker)
+		}
+	}
+	for ticker := range s.liveSnapshots {
+		if _, watched := tickers[ticker]; !watched {
+			s.dropLive(ticker)
+		}
+	}
+	for ticker := range s.lastHighFreqAt {
+		if _, watched := tickers[ticker]; !watched {
+			delete(s.lastHighFreqAt, ticker)
+		}
+	}
+	for ticker := range s.highFreqRetry {
+		if _, watched := tickers[ticker]; !watched {
+			delete(s.highFreqRetry, ticker)
+		}
+	}
 }

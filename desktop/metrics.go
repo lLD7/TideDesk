@@ -1,18 +1,21 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
+	"context"
 	"math"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"gammagrid.local/desktop/internal/marketclock"
+	"gammagrid.local/desktop/internal/store"
+	"gammagrid.local/desktop/internal/viewmodel"
 )
+
+// ModelVersion identifies the Go formulas stored in ticker_day_summary.core_sha.
+const ModelVersion = "v2.0-cboe"
 
 const (
 	defaultRiskFreeRate                  = 0.05
@@ -51,9 +54,6 @@ const (
 	ivBisectionSteps = 60
 )
 
-// Python's weekday() is Monday=0 .. Sunday=6; Go's time.Weekday() is Sunday=0 .. Saturday=6.
-var weekdaysCNByGoWeekday = []string{"日", "一", "二", "三", "四", "五", "六"}
-
 var weatherCN = map[string][2]string{
 	weatherClear:     {"晴朗", "正 Gamma，翻转点远 — 做市商对冲在压制波动"},
 	weatherFair:      {"多云", "正 Gamma，但翻转点已在射程内 — 压制可能失效"},
@@ -81,37 +81,6 @@ func snapshotHistoryDays() int {
 		}
 	}
 	return defaultSnapshotHistoryDays
-}
-
-// StoredOptionRow represents a row from option_snapshots / option_snapshots_archive
-// enriched with solved IV and Black-Scholes Greeks when needed.
-type StoredOptionRow struct {
-	Ticker          string
-	CollectedAt     string
-	UnderlyingPrice float64
-	Expiry          string // YYYY-MM-DD
-	Strike          float64
-	OptionType      string // "call" or "put"
-	LastPrice       *float64
-	Bid             *float64
-	Ask             *float64
-	Volume          *float64
-	OI              *float64
-	IV              *float64
-	ProviderIV      *float64
-	InTheMoney      bool
-	Delta           *float64
-	Gamma           *float64
-	Theta           *float64
-	Vega            *float64
-	Rho             *float64
-	Vanna           *float64
-	Charm           *float64
-	Source          string
-	ContractSymbol  string
-	QuoteTimestamp  string
-	IVIsOurs        bool
-	IVUnreliable    bool
 }
 
 func floatPtr(v float64) *float64 {
@@ -150,12 +119,12 @@ func yearsToExpiry(expiryISO, collectedAt string) float64 {
 	if len(expiryISO) < 10 {
 		return 0
 	}
-	expDate, err := time.ParseInLocation("2006-01-02", expiryISO[:10], marketZone)
+	expDate, err := time.ParseInLocation("2006-01-02", expiryISO[:10], marketclock.Zone)
 	if err != nil {
 		return 0
 	}
-	expCloseUTC := time.Date(expDate.Year(), expDate.Month(), expDate.Day(), 16, 0, 0, 0, marketZone).UTC()
-	colUTC, ok := parseAnyTime(collectedAt)
+	expCloseUTC := time.Date(expDate.Year(), expDate.Month(), expDate.Day(), 16, 0, 0, 0, marketclock.Zone).UTC()
+	colUTC, ok := marketclock.ParseTime(collectedAt)
 	if !ok {
 		return 0
 	}
@@ -177,7 +146,7 @@ func bsPrice(s, k, t, sigma, r float64, isCall bool, q float64) float64 {
 
 // contractPriceForIV matches metrics_core.contract_price_for_iv:
 // mid of (bid, ask) when bid > 0, ask > 0, and ask >= bid; otherwise last_price.
-func contractPriceForIV(row *StoredOptionRow) *float64 {
+func contractPriceForIV(row *store.StoredOptionRow) *float64 {
 	if isValidPos(row.Bid) && isValidPos(row.Ask) && *row.Ask >= *row.Bid {
 		mid := 0.5 * (*row.Bid + *row.Ask)
 		return &mid
@@ -263,9 +232,13 @@ func solveImpliedVolatility(price, s, k, t, r float64, optionType string, q floa
 
 // withSolvedIV matches metrics_core.with_solved_iv: Cboe chains and VIX/VIXW keep
 // their native IV; other sources solve IV from contractPriceForIV.
-func withSolvedIV(rows []StoredOptionRow, r float64, q float64) {
+func withSolvedIV(rows []store.StoredOptionRow, r float64, q float64) {
+	_ = solveIV(context.Background(), rows, r, q)
+}
+
+func solveIV(ctx context.Context, rows []store.StoredOptionRow, r, q float64) error {
 	if len(rows) == 0 {
-		return
+		return ctx.Err()
 	}
 	allCboe := true
 	for i := range rows {
@@ -278,9 +251,12 @@ func withSolvedIV(rows []StoredOptionRow, r float64, q float64) {
 		for i := range rows {
 			rows[i].IVIsOurs = false
 		}
-		return
+		return ctx.Err()
 	}
 	for i := range rows {
+		if i%256 == 0 && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		row := &rows[i]
 		if strings.EqualFold(row.Ticker, "VIX") || strings.EqualFold(row.Ticker, "VIXW") {
 			row.IVIsOurs = false
@@ -300,6 +276,7 @@ func withSolvedIV(rows []StoredOptionRow, r float64, q float64) {
 			row.IVIsOurs = false
 		}
 	}
+	return ctx.Err()
 }
 
 type bsGreeks struct {
@@ -361,7 +338,7 @@ func calcBSGreeks(s, k, t, r, sigma float64, optionType string, q float64) bsGre
 
 // enrichGreeks populates missing Greeks (and merges provider Greeks where present),
 // matching screener_table / merge_provider_greeks in metrics_core.py.
-func enrichGreeks(rows []StoredOptionRow, r float64, q float64) {
+func enrichGreeks(rows []store.StoredOptionRow, r float64, q float64) {
 	withSolvedIV(rows, r, q)
 	for i := range rows {
 		row := &rows[i]
@@ -401,7 +378,7 @@ func enrichGreeks(rows []StoredOptionRow, r float64, q float64) {
 
 // rowExposure computes the single-contract dealer exposure for dimension ("gex", "vanna", "charm"),
 // matching metrics_core.contract_exposure. Assumes withSolvedIV has run.
-func rowExposure(row *StoredOptionRow, dimension string, r float64, q float64) (float64, bool) {
+func rowExposure(row *store.StoredOptionRow, dimension string, r float64, q float64) (float64, bool) {
 	if !isValidFinite(row.OI) || !(row.UnderlyingPrice > 0) {
 		return 0, false
 	}
@@ -479,7 +456,7 @@ type ExposureMatrix struct {
 	Cells    [][]float64 // len(Strikes) x len(Expiries)
 }
 
-func buildExposureMatrixPresolved(rows []StoredOptionRow, dimension string, allowedExpiries map[string]bool, r, q float64) ExposureMatrix {
+func buildExposureMatrixPresolved(ctx context.Context, rows []store.StoredOptionRow, dimension string, allowedExpiries map[string]bool, r, q float64) ExposureMatrix {
 	if len(rows) == 0 {
 		return ExposureMatrix{}
 	}
@@ -495,6 +472,9 @@ func buildExposureMatrixPresolved(rows []StoredOptionRow, dimension string, allo
 	}
 	acc := make(map[cellKey]cellAccum, 512)
 	for i := range rows {
+		if i%256 == 0 && ctx.Err() != nil {
+			return ExposureMatrix{}
+		}
 		row := &rows[i]
 		exp := row.Expiry
 		if len(exp) >= 10 {
@@ -531,6 +511,9 @@ func buildExposureMatrixPresolved(rows []StoredOptionRow, dimension string, allo
 
 	cells := make([][]float64, len(strikes))
 	for si, k := range strikes {
+		if si%64 == 0 && ctx.Err() != nil {
+			return ExposureMatrix{}
+		}
 		rowCells := make([]float64, len(expiries))
 		for ei, e := range expiries {
 			ck := cellKey{strike: k, expiry: e}
@@ -562,13 +545,13 @@ func (m ExposureMatrix) sumAll() float64 {
 }
 
 // gammaFlipFromMatrix matches metrics_core.gamma_flip_from_matrix / _nearest_crossing:
-// 1. Sorts strikes ascending.
-// 2. Sums each strike's exposure across expiries (treating NaN as 0).
-// 3. Computes cumulative sum across strikes in ascending order.
-// 4. Finds crossings between strictly nonzero cumulative values whose nearest significant
-//    cumulative values (> 1e-4 * max(|cumulative|)) on either side have opposite signs.
-// 5. Linearly interpolates each crossing and returns the one nearest spot, provided it is
-//    within GAMMA_FLIP_MAX_DISTANCE (25%) of spot.
+//  1. Sorts strikes ascending.
+//  2. Sums each strike's exposure across expiries (treating NaN as 0).
+//  3. Computes cumulative sum across strikes in ascending order.
+//  4. Finds crossings between strictly nonzero cumulative values whose nearest significant
+//     cumulative values (> 1e-4 * max(|cumulative|)) on either side have opposite signs.
+//  5. Linearly interpolates each crossing and returns the one nearest spot, provided it is
+//     within GAMMA_FLIP_MAX_DISTANCE (25%) of spot.
 func gammaFlipFromMatrix(mat ExposureMatrix, spot float64) *float64 {
 	n := len(mat.Strikes)
 	if n == 0 || len(mat.Expiries) == 0 || math.IsNaN(spot) || math.IsInf(spot, 0) {
@@ -664,7 +647,7 @@ func gammaFlipFromMatrix(mat ExposureMatrix, spot float64) *float64 {
 
 // dealerWalls matches metrics_core.dealer_walls: strike with maximum open interest
 // in calls and puts across the given rows (ties go to the lowest strike per pandas idxmax).
-func dealerWalls(rows []StoredOptionRow, allowedExpiries map[string]bool) (*float64, *float64) {
+func dealerWalls(rows []store.StoredOptionRow, allowedExpiries map[string]bool) (*float64, *float64) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
@@ -714,7 +697,7 @@ func idxMaxMap(m map[float64]float64) *float64 {
 // gexWallsPresolved matches metrics_core.gex_walls:
 // call_gex_wall is the strike with the largest positive total call GEX,
 // put_gex_wall is the strike with the most negative total put GEX.
-func gexWallsPresolved(rows []StoredOptionRow, r, q float64) (*float64, *float64) {
+func gexWallsPresolved(rows []store.StoredOptionRow, r, q float64) (*float64, *float64) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
@@ -788,7 +771,7 @@ func gexWallsPresolved(rows []StoredOptionRow, r, q float64) (*float64, *float64
 }
 
 // maxPain matches metrics_core.max_pain.
-func maxPain(rows []StoredOptionRow) *float64 {
+func maxPain(rows []store.StoredOptionRow) *float64 {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -817,32 +800,24 @@ func maxPain(rows []StoredOptionRow) *float64 {
 		strikes = append(strikes, k)
 	}
 	sort.Float64s(strikes)
-	bestStrike := strikes[0]
-	bestPain := math.Inf(1)
-	for _, s := range strikes {
-		callPain := 0.0
-		putPain := 0.0
-		for _, k := range strikes {
-			if s > k {
-				if oi := callOI[k]; oi > 0 {
-					callPain += (s - k) * oi
-				}
-			} else if k > s {
-				if oi := putOI[k]; oi > 0 {
-					putPain += (k - s) * oi
-				}
-			}
-		}
-		pain := callPain + putPain
-		if pain < bestPain {
-			bestPain = pain
-			bestStrike = s
+	// Between strikes the payout slope is the call OI at or below the
+	// strike minus the put OI above it. Both sides move the slope upward.
+	// The first nonnegative slope is the smallest minimizing strike.
+	var callPrefix, putRemaining float64
+	for _, strike := range strikes {
+		putRemaining += putOI[strike]
+	}
+	for _, strike := range strikes {
+		callPrefix += callOI[strike]
+		putRemaining -= putOI[strike]
+		if callPrefix >= putRemaining {
+			return floatPtr(strike)
 		}
 	}
-	return floatPtr(bestStrike)
+	return floatPtr(strikes[len(strikes)-1])
 }
 
-func contractsBackingExpiry(rows []StoredOptionRow) int {
+func contractsBackingExpiry(rows []store.StoredOptionRow) int {
 	cnt := 0
 	for i := range rows {
 		if valOrZero(rows[i].OI) > 0 {
@@ -854,7 +829,7 @@ func contractsBackingExpiry(rows []StoredOptionRow) int {
 
 // atmImpliedVolatilityPresolved matches metrics.atm_implied_volatility on rows
 // of a single expiry that have already run through withSolvedIV.
-func atmImpliedVolatilityPresolved(rows []StoredOptionRow, spot float64) *float64 {
+func atmImpliedVolatilityPresolved(rows []store.StoredOptionRow, spot float64) *float64 {
 	if len(rows) == 0 || !(spot > 0) || math.IsNaN(spot) {
 		return nil
 	}
@@ -900,7 +875,7 @@ type ExpectedMoveResult struct {
 }
 
 // expectedMovePresolved matches metrics.expected_move on rows of a single expiry.
-func expectedMovePresolved(rows []StoredOptionRow, spot float64) *ExpectedMoveResult {
+func expectedMovePresolved(rows []store.StoredOptionRow, spot float64) *ExpectedMoveResult {
 	if len(rows) == 0 || !(spot > 0) || math.IsNaN(spot) {
 		return nil
 	}
@@ -947,7 +922,7 @@ func weatherExpiries(expiries []string, moment string, horizonDays, minExpiries 
 	sort.Strings(ordered)
 	var inside []string
 	for _, e := range ordered {
-		if calcDTE(e, moment) <= horizonDays {
+		if viewmodel.CalcDTE(e, moment) <= horizonDays {
 			inside = append(inside, e)
 		}
 	}
@@ -985,7 +960,7 @@ func weatherState(netGEX, spot float64, gammaFlip *float64, nearPct, farPct floa
 }
 
 // computeGammaWeatherPresolved matches metrics.gamma_weather on rows that already ran withSolvedIV.
-func computeGammaWeatherPresolved(rows []StoredOptionRow, r, q float64) *GammaWeatherResult {
+func computeGammaWeatherPresolved(ctx context.Context, rows []store.StoredOptionRow, r, q float64) *GammaWeatherResult {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -1014,7 +989,7 @@ func computeGammaWeatherPresolved(rows []StoredOptionRow, r, q float64) *GammaWe
 	for _, e := range chosen {
 		allowed[e] = true
 	}
-	mat := buildExposureMatrixPresolved(rows, "gex", allowed, r, q)
+	mat := buildExposureMatrixPresolved(ctx, rows, "gex", allowed, r, q)
 	if len(mat.Strikes) == 0 {
 		return nil
 	}
@@ -1036,7 +1011,7 @@ func computeGammaWeatherPresolved(rows []StoredOptionRow, r, q float64) *GammaWe
 		}
 	}
 	maxChosen := chosen[len(chosen)-1]
-	horizonDTE := calcDTE(maxChosen, moment)
+	horizonDTE := viewmodel.CalcDTE(maxChosen, moment)
 	var flipDist *float64
 	if flip != nil {
 		d := math.Abs(*flip-spot) / spot * 100.0
@@ -1059,7 +1034,7 @@ func computeGammaWeatherPresolved(rows []StoredOptionRow, r, q float64) *GammaWe
 }
 
 // ivWeightedAveragePresolved matches metrics.iv_weighted_average on rows that already ran withSolvedIV.
-func ivWeightedAveragePresolved(rows []StoredOptionRow) *float64 {
+func ivWeightedAveragePresolved(rows []store.StoredOptionRow) *float64 {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -1090,162 +1065,4 @@ func ivWeightedAveragePresolved(rows []StoredOptionRow) *float64 {
 		return nil
 	}
 	return floatPtr(num / den)
-}
-
-// --- Formatting helpers matching app/presentation.py ---
-
-func fmtCompact(v *float64, signed bool, digits int) string {
-	if v == nil || math.IsNaN(*v) || math.IsInf(*v, 0) {
-		return "—"
-	}
-	val := *v
-	sign := ""
-	if signed && val > 0 {
-		sign = "+"
-	} else if val < 0 {
-		sign = "-"
-	}
-	mag := math.Abs(val)
-	type unit struct {
-		limit  float64
-		suffix string
-	}
-	for _, u := range []unit{{1e12, "T"}, {1e9, "B"}, {1e6, "M"}, {1e3, "K"}} {
-		if mag >= u.limit {
-			return fmt.Sprintf("%s%.*f%s", sign, digits, mag/u.limit, u.suffix)
-		}
-	}
-	return fmt.Sprintf("%s%.0f", sign, mag)
-}
-
-func fmtCompactVal(val float64, signed bool, digits int) string {
-	return fmtCompact(&val, signed, digits)
-}
-
-func fmtCellCompact(val float64) string {
-	if math.IsNaN(val) || math.IsInf(val, 0) {
-		return ""
-	}
-	if val == 0 {
-		return "·"
-	}
-	return fmtCompactVal(val, false, 1)
-}
-
-func fmtPrice(v *float64, digits int) string {
-	if v == nil || math.IsNaN(*v) || math.IsInf(*v, 0) {
-		return "—"
-	}
-	return fmtPriceVal(*v, digits)
-}
-
-func fmtPriceVal(val float64, digits int) string {
-	if math.IsNaN(val) || math.IsInf(val, 0) {
-		return "—"
-	}
-	neg := val < 0
-	mag := math.Abs(val)
-	raw := fmt.Sprintf("%.*f", digits, mag)
-	parts := strings.SplitN(raw, ".", 2)
-	intPart := parts[0]
-	if len(intPart) > 3 {
-		var b strings.Builder
-		rem := len(intPart) % 3
-		if rem > 0 {
-			b.WriteString(intPart[:rem])
-			if len(intPart) > rem {
-				b.WriteByte(',')
-			}
-		}
-		for i := rem; i < len(intPart); i += 3 {
-			if i > rem {
-				b.WriteByte(',')
-			}
-			b.WriteString(intPart[i : i+3])
-		}
-		intPart = b.String()
-	}
-	prefix := ""
-	if neg {
-		prefix = "-"
-	}
-	if len(parts) == 2 {
-		return prefix + intPart + "." + parts[1]
-	}
-	return prefix + intPart
-}
-
-func fmtStrikeLabel(v *float64) string {
-	if v == nil || math.IsNaN(*v) || math.IsInf(*v, 0) {
-		return "—"
-	}
-	return fmtStrikeVal(*v)
-}
-
-func fmtStrikeVal(val float64) string {
-	if math.IsNaN(val) || math.IsInf(val, 0) {
-		return "—"
-	}
-	return strconv.FormatFloat(val, 'g', 6, 64)
-}
-
-func fmtPct(v *float64, digits int, signed bool) string {
-	if v == nil || math.IsNaN(*v) || math.IsInf(*v, 0) {
-		return "—"
-	}
-	return fmtPctVal(*v, digits, signed)
-}
-
-func fmtPctVal(val float64, digits int, signed bool) string {
-	if math.IsNaN(val) || math.IsInf(val, 0) {
-		return "—"
-	}
-	if signed {
-		return fmt.Sprintf("%+.*f%%", digits, val*100.0)
-	}
-	return fmt.Sprintf("%.*f%%", digits, val*100.0)
-}
-
-func fmtExpiryShort(expiryISO string) string {
-	if len(expiryISO) < 10 {
-		return expiryISO
-	}
-	t, err := time.Parse("2006-01-02", expiryISO[:10])
-	if err != nil {
-		return expiryISO
-	}
-	return fmt.Sprintf("%s %s", t.Format("01-02"), weekdaysCNByGoWeekday[t.Weekday()])
-}
-
-func calcDTE(expiryISO, moment string) int {
-	if len(expiryISO) < 10 || len(moment) < 10 {
-		return 0
-	}
-	eDate, err1 := time.Parse("2006-01-02", expiryISO[:10])
-	mDate, err2 := time.Parse("2006-01-02", moment[:10])
-	if err1 != nil || err2 != nil {
-		return 0
-	}
-	return int(eDate.Sub(mDate).Hours() / 24)
-}
-
-var (
-	coreSHAOnce sync.Once
-	cachedSHA   string
-)
-
-// computeCoreSHA computes the exact same SHA-256 over metrics_core.py, metrics.py,
-// and day_summary.py as app/day_summary.py:CODE_SHA.
-func computeCoreSHA(root string) string {
-	coreSHAOnce.Do(func() {
-		h := sha256.New()
-		for _, name := range []string{"metrics_core.py", "metrics.py", "day_summary.py"} {
-			b, err := os.ReadFile(filepath.Join(root, "app", name))
-			if err == nil {
-				_, _ = h.Write(b)
-			}
-		}
-		cachedSHA = hex.EncodeToString(h.Sum(nil))
-	})
-	return cachedSHA
 }

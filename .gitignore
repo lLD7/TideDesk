@@ -1,5 +1,6 @@
 data/
 __pycache__/
+docs/
 *.pyc
 .venv/
 .DS_Store

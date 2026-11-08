@@ -8,6 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"gammagrid.local/desktop/internal/marketclock"
+	"gammagrid.local/desktop/internal/store"
+	"gammagrid.local/desktop/internal/viewmodel"
+
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
@@ -98,8 +102,8 @@ func exposureColor(norm float64) ui.Color {
 }
 
 type DesktopApp struct {
-	win *mygo.Window
-	api *APIClient
+	win     *mygo.Window
+	service *DesktopService
 
 	// Navigation & sidebar
 	collapsed       bool
@@ -109,6 +113,7 @@ type DesktopApp struct {
 	addingTicker    bool
 	collecting      bool
 	viewKey         string
+	volKey          string
 	viewSeq         uint64
 	viewCancel      context.CancelFunc
 	stateSeq        uint64
@@ -151,17 +156,17 @@ type DesktopApp struct {
 	runsTable     ui.ListState
 
 	// Loaded payloads (owned by main thread via win.Update)
-	state    *AppStateResponse
-	wb       *WorkbenchResponse
-	vol      *VolatilityResponse
-	chain    *ChainResponse
-	contract *ContractResponse
-	flow     *FlowResponse
+	state    *viewmodel.AppStateResponse
+	wb       *viewmodel.WorkbenchResponse
+	vol      *viewmodel.VolatilityResponse
+	chain    *viewmodel.ChainResponse
+	contract *viewmodel.ContractResponse
+	flow     *viewmodel.FlowResponse
 }
 
-func NewDesktopApp(api *APIClient) *DesktopApp {
+func NewDesktopApp(service *DesktopService) *DesktopApp {
 	return &DesktopApp{
-		api:              api,
+		service:          service,
 		nExpiries:        8,
 		strikesSide:      10,
 		pressureRangePct: 10,
@@ -192,15 +197,16 @@ func (a *DesktopApp) refreshAll() {
 		if a.stateCancel != nil {
 			a.stateCancel()
 		}
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(a.service.ctx)
 		a.stateCancel = cancel
 		a.viewKey = ""
+		a.volKey = ""
 		a.viewSeq++
 		if a.viewCancel != nil {
 			a.viewCancel()
 		}
 		go func() {
-			st, err := a.api.WithContext(ctx).FetchState()
+			st, err := a.service.state(ctx)
 			a.update(func() {
 				if seq != a.stateSeq || ctx.Err() != nil {
 					return
@@ -247,7 +253,17 @@ func (a *DesktopApp) loadActiveView(sym string) {
 		a.chainFilterKey = filterKey
 	}
 	page := a.chainPage
-	key := fmt.Sprintf("%s/%d/%s/%s/%s/%d/%d/%g/%s/%g/%d/%s/%d/%g", sym, view, dim, side, asOf, nExp, strk, width, chainSide, band, oi, exp, page, pressurePct)
+	key := fmt.Sprintf("%s/%d", sym, view)
+	switch view {
+	case 0:
+		key += fmt.Sprintf("/%s/%s/%s/%d/%d/%g", dim, side, asOf, nExp, strk, width)
+	case 1:
+		key += fmt.Sprintf("/%s/%s/%d/%g", dim, asOf, nExp, pressurePct)
+	case 2:
+		key += fmt.Sprintf("/%s/%d", filterKey, page)
+	}
+	volKey := fmt.Sprintf("%s/%g", sym, width)
+	needVol := a.vol == nil || a.volKey != volKey
 	if key == a.viewKey {
 		return
 	}
@@ -262,7 +278,7 @@ func (a *DesktopApp) loadActiveView(sym string) {
 	}
 	a.contractSeq++
 	a.contract = nil
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(a.service.ctx)
 	a.viewCancel = cancel
 	a.loading = true
 	// Clear the old page before changing symbol/filter so it cannot masquerade
@@ -270,7 +286,9 @@ func (a *DesktopApp) loadActiveView(sym string) {
 	switch view {
 	case 0:
 		a.wb = nil
-		a.vol = nil
+		if a.vol != nil && a.vol.Ticker != sym {
+			a.vol = nil
+		}
 	case 1:
 		a.wb = nil
 	case 2:
@@ -290,24 +308,19 @@ func (a *DesktopApp) loadActiveView(sym string) {
 			return
 		case <-timer.C:
 		}
-		api := a.api.WithContext(ctx)
-		var wb *WorkbenchResponse
-		var vol *VolatilityResponse
-		var chain *ChainResponse
-		var flow *FlowResponse
+		var wb *viewmodel.WorkbenchResponse
+		var chain *viewmodel.ChainResponse
+		var flow *viewmodel.FlowResponse
 		var err error
 		switch view {
 		case 0:
-			wb, err = api.FetchWorkbench(sym, dim, side, asOf, nExp, strk)
-			if err == nil {
-				vol, _ = api.FetchVolatility(sym, width)
-			}
+			wb, err = a.service.Workbench(ctx, sym, workbenchQuery{Dimension: dim, Side: side, AsOf: asOf, Expiries: nExp, Strikes: strk})
 		case 1:
-			wb, err = api.FetchStrikePressure(sym, dim, asOf, nExp, pressurePct)
+			wb, err = a.service.Workbench(ctx, sym, workbenchQuery{Dimension: dim, AsOf: asOf, Expiries: nExp, RangePct: pressurePct})
 		case 2:
-			chain, err = api.FetchChain(sym, exp, chainSide, band, oi, page)
+			chain, err = a.service.Chain(ctx, sym, chainQuery{Expiries: exp, Side: chainSide, Band: band, MinOI: oi, Page: page})
 		case 3:
-			flow, err = api.FetchFlow(sym)
+			flow, err = a.service.Flow(ctx, sym)
 		}
 		a.update(func() {
 			if seq != a.viewSeq || ctx.Err() != nil {
@@ -323,7 +336,6 @@ func (a *DesktopApp) loadActiveView(sym string) {
 			switch view {
 			case 0:
 				a.wb = wb
-				a.vol = vol
 			case 1:
 				a.wb = wb
 			case 2:
@@ -332,6 +344,17 @@ func (a *DesktopApp) loadActiveView(sym string) {
 				a.flow = flow
 			}
 		})
+		if view == 0 && needVol && err == nil && ctx.Err() == nil {
+			vol, volErr := a.service.Volatility(ctx, sym, width)
+			if volErr == nil {
+				a.update(func() {
+					if seq == a.viewSeq && ctx.Err() == nil {
+						a.vol = vol
+						a.volKey = volKey
+					}
+				})
+			}
+		}
 	}()
 }
 
@@ -342,10 +365,10 @@ func (a *DesktopApp) loadContract(expiryISO string, strike float64, optType stri
 	if a.contractCancel != nil {
 		a.contractCancel()
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(a.service.ctx)
 	a.contractCancel = cancel
 	go func() {
-		ct, err := a.api.WithContext(ctx).FetchContract(sym, expiryISO, strike, optType)
+		ct, err := a.service.Contract(ctx, sym, contractQuery{Expiry: expiryISO, Strike: strike, Side: optType})
 		a.update(func() {
 			if seq != a.contractSeq || ctx.Err() != nil {
 				return
@@ -359,9 +382,9 @@ func (a *DesktopApp) loadContract(expiryISO string, strike float64, optType stri
 	}()
 }
 
-func (a *DesktopApp) saveSchedule(cfg ScheduleConfig) {
+func (a *DesktopApp) saveSchedule(cfg marketclock.ScheduleConfig) {
 	go func() {
-		err := a.api.postJSON("/api/schedule", cfg, nil)
+		err := a.service.saveSchedule(a.service.ctx, cfg)
 		a.update(func() {
 			if err != nil {
 				a.statusMsg = "设置未保存: " + err.Error()
@@ -374,7 +397,7 @@ func (a *DesktopApp) saveSchedule(cfg ScheduleConfig) {
 	}()
 }
 
-func (a *DesktopApp) currentTickerSummary() *TickerSummary {
+func (a *DesktopApp) currentTickerSummary() *viewmodel.TickerSummary {
 	if a.state == nil || a.selectedSym == "" {
 		return nil
 	}
@@ -386,18 +409,13 @@ func (a *DesktopApp) currentTickerSummary() *TickerSummary {
 	return nil
 }
 
-func (a *DesktopApp) saveTickerCollect(sym string, lowEn, highEn bool, highSec int) {
+func (a *DesktopApp) saveTickerCollect(sym string, lowEn, highEn bool, highSec, highMinutes int) {
 	if sym == "" {
 		return
 	}
 	go func() {
-		payload := map[string]any{
-			"ticker":            sym,
-			"low_freq_enabled":  lowEn,
-			"high_freq_enabled": highEn,
-			"high_freq_sec":     highSec,
-		}
-		err := a.api.postJSON("/api/ticker_collect_config", payload, nil)
+		cfg := store.TickerCollectConfig{Ticker: sym, LowFreqEnabled: lowEn, HighFreqEnabled: highEn, HighFreqSec: highSec, HighFreqMinutes: highMinutes}
+		err := a.service.saveTickerConfig(a.service.ctx, cfg)
 		a.update(func() {
 			if err != nil {
 				a.statusMsg = "频率设置未保存: " + err.Error()
@@ -416,16 +434,13 @@ func (a *DesktopApp) triggerHighFreqTick(sym string) {
 	a.collecting = true
 	a.statusMsg = "正在高频轻量采样 " + sym + "…"
 	go func() {
-		var out struct {
-			Note string `json:"note"`
-		}
-		err := a.api.postJSON("/api/collect_intraday", map[string]any{"ticker": sym}, &out)
+		err := a.service.collectHighFreqTick(a.service.ctx, sym)
 		a.update(func() {
 			a.collecting = false
 			if err != nil {
 				a.statusMsg = "高频采样失败: " + err.Error()
 			} else {
-				a.statusMsg = fmt.Sprintf("高频采样完成 (%s: %s)", sym, out.Note)
+				a.statusMsg = "高频采样完成 · " + sym
 			}
 		})
 		a.refreshAll()
@@ -439,7 +454,7 @@ func (a *DesktopApp) renderInlineTickerCollectControls(c *ui.Context) {
 	}
 	sym := ts.Symbol
 	lowEn := ts.LowFreqEnabled
-	highEn := ts.HighFreqEnabled
+	highEn := ts.HighFreqEnabled && activeHighFreq(store.TickerCollectConfig{HighFreqEnabled: true, HighFreqUntil: ts.HighFreqUntil}, a.service.now())
 	highSec := ts.HighFreqSec
 	if highSec <= 0 {
 		highSec = 60
@@ -460,7 +475,7 @@ func (a *DesktopApp) renderInlineTickerCollectControls(c *ui.Context) {
 			Tooltip("开启或关闭所选股票的低频全链落库抓取")
 		lowBtn.Children(func() { ui.Text(c, lowLabel).FontSize(11).Bold() })
 		if lowBtn.Clicked() {
-			a.saveTickerCollect(sym, !lowEn, highEn, highSec)
+			a.saveTickerCollect(sym, !lowEn, highEn, highSec, 0)
 		}
 
 		highLabel := "⚡高频流: 关"
@@ -473,10 +488,10 @@ func (a *DesktopApp) renderInlineTickerCollectControls(c *ui.Context) {
 		}
 		highBtn := ui.ButtonBase(c.Key("inline_high_"+sym)).Padding(3, 8).Radius(5).
 			Background(highBg).TextColor(highFg).Label(highLabel).
-			Tooltip("开启或关闭所选股票的分钟级高频流采样（内存差分+轻量分时落库，零全链膨胀）")
+			Tooltip("按侧栏设置运行高频采样，到期或收盘后自动停止")
 		highBtn.Children(func() { ui.Text(c, highLabel).FontSize(11).Bold() })
 		if highBtn.Clicked() {
-			a.saveTickerCollect(sym, lowEn, !highEn, highSec)
+			a.saveTickerCollect(sym, lowEn, !highEn, highSec, 0)
 		}
 
 		freqOpts := []string{"1m", "2m", "3m", "5m", "10m"}
@@ -497,7 +512,7 @@ func (a *DesktopApp) renderInlineTickerCollectControls(c *ui.Context) {
 					break
 				}
 			}
-			a.saveTickerCollect(sym, lowEn, highEn, newSec)
+			a.saveTickerCollect(sym, lowEn, highEn, newSec, 0)
 		}
 
 		sampleBtn := ui.ButtonBase(c.Key("inline_hf_tick_"+sym)).Padding(3, 7).Radius(5).
@@ -517,17 +532,14 @@ func (a *DesktopApp) triggerCollect(sym string) {
 	a.collecting = true
 	a.statusMsg = "正在采集数据…"
 	go func() {
-		var out struct {
-			Results map[string]string `json:"results"`
-		}
-		err := a.api.postJSON("/api/collect", map[string]any{"ticker": sym}, &out)
+		results, err := a.service.Collect(a.service.ctx, sym)
 		a.update(func() {
 			a.collecting = false
 			if err != nil {
 				a.statusMsg = "采集失败: " + err.Error()
 			} else {
-				parts := make([]string, 0, len(out.Results))
-				for k, v := range out.Results {
+				parts := make([]string, 0, len(results))
+				for k, v := range results {
 					parts = append(parts, fmt.Sprintf("%s: %s", k, v))
 				}
 				a.statusMsg = "采集完成 (" + strings.Join(parts, ", ") + ")"
@@ -544,24 +556,16 @@ func (a *DesktopApp) triggerAddTicker() {
 	}
 	a.addingTicker = true
 	go func() {
-		var out struct {
-			Ticker string `json:"ticker"`
-			Note   string `json:"note"`
-		}
-		err := a.api.postJSON("/api/watchlist/add", map[string]any{"ticker": sym}, &out)
+		ticker, err := a.service.setWatchlist(a.service.ctx, sym, true)
 		a.update(func() {
 			a.addingTicker = false
 			if err != nil {
 				a.statusMsg = err.Error()
 			} else {
 				a.newTickerTxt = ""
-				a.selectedSym = sym
+				a.selectedSym = ticker
 				a.momentChoice = ""
-				if out.Note != "" {
-					a.statusMsg = out.Note
-				} else {
-					a.statusMsg = "已添加 " + sym
-				}
+				a.statusMsg = "已添加 " + ticker
 			}
 		})
 		if err == nil {
@@ -572,7 +576,7 @@ func (a *DesktopApp) triggerAddTicker() {
 
 func (a *DesktopApp) triggerRemoveTicker(sym string) {
 	go func() {
-		err := a.api.postJSON("/api/watchlist/remove", map[string]any{"ticker": sym}, nil)
+		_, err := a.service.setWatchlist(a.service.ctx, sym, false)
 		a.update(func() {
 			if err != nil {
 				a.statusMsg = err.Error()
@@ -760,7 +764,7 @@ func (a *DesktopApp) renderSidebar(c *ui.Context, vibrant bool) {
 			if ts := a.currentTickerSummary(); ts != nil {
 				sym := ts.Symbol
 				lowEn := ts.LowFreqEnabled
-				highEn := ts.HighFreqEnabled
+				highEn := ts.HighFreqEnabled && activeHighFreq(store.TickerCollectConfig{HighFreqEnabled: true, HighFreqUntil: ts.HighFreqUntil}, a.service.now())
 				highSec := ts.HighFreqSec
 				if highSec <= 0 {
 					highSec = 60
@@ -787,7 +791,7 @@ func (a *DesktopApp) renderSidebar(c *ui.Context, vibrant bool) {
 							Background(colorSurface).Border(1, colorBorder).Center().TextColor(lowCol).Label(lowTxt)
 						bLow.Children(func() { ui.Text(c, lowTxt).FontSize(10.5).Bold() })
 						if bLow.Clicked() {
-							a.saveTickerCollect(sym, !lowEn, highEn, highSec)
+							a.saveTickerCollect(sym, !lowEn, highEn, highSec, 0)
 						}
 
 						highTxt := "高频实时: 关"
@@ -800,7 +804,7 @@ func (a *DesktopApp) renderSidebar(c *ui.Context, vibrant bool) {
 							Background(colorSurface).Border(1, colorBorder).Center().TextColor(highCol).Label(highTxt)
 						bHigh.Children(func() { ui.Text(c, highTxt).FontSize(10.5).Bold() })
 						if bHigh.Clicked() {
-							a.saveTickerCollect(sym, lowEn, !highEn, highSec)
+							a.saveTickerCollect(sym, lowEn, !highEn, highSec, 0)
 						}
 					})
 					ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
@@ -823,7 +827,27 @@ func (a *DesktopApp) renderSidebar(c *ui.Context, vibrant bool) {
 									break
 								}
 							}
-							a.saveTickerCollect(sym, lowEn, highEn, newSec)
+							a.saveTickerCollect(sym, lowEn, highEn, newSec, 0)
+						}
+					})
+					ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
+						ui.Text(c, "高频时长").FontSize(10.5).TextColor(colorMuted).Grow(1)
+						durations := []string{"30 分钟", "1 小时", "2 小时", "4 小时"}
+						minutes := []int{30, 60, 120, 240}
+						chosen := durations[2]
+						for i, duration := range minutes {
+							if duration == ts.HighFreqMinutes {
+								chosen = durations[i]
+							}
+						}
+						if ui.Select(c.Key("side_hf_duration_"+sym), &chosen, durations).Width(116).
+							Label("高频运行时长，最晚收盘停止").Changed() {
+							for i, label := range durations {
+								if label == chosen {
+									a.saveTickerCollect(sym, lowEn, highEn, highSec, minutes[i])
+									break
+								}
+							}
 						}
 					})
 				})
@@ -992,7 +1016,7 @@ func (a *DesktopApp) renderMainPane(c *ui.Context, titleLeft float32) {
 		}
 
 		// Every tab shares a cached summary, not a complete matrix request.
-		var ribbon *RibbonData
+		var ribbon *viewmodel.RibbonData
 		if a.state != nil {
 			for _, summary := range a.state.Tickers {
 				if summary.Symbol == a.selectedSym {
@@ -1023,7 +1047,7 @@ func (a *DesktopApp) renderMainPane(c *ui.Context, titleLeft float32) {
 	})
 }
 
-func (a *DesktopApp) renderRibbon(c *ui.Context, r *RibbonData) {
+func (a *DesktopApp) renderRibbon(c *ui.Context, r *viewmodel.RibbonData) {
 	ui.Row(c).Padding(8, 14, 4, 14).Gap(6).AlignItems(ui.Stretch).Children(func() {
 		// Regime card
 		accent := colorNeg

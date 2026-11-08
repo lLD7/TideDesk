@@ -2,239 +2,29 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"fmt"
 	"math"
-	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
+
+	"gammagrid.local/desktop/internal/marketclock"
+	"gammagrid.local/desktop/internal/store"
+	"gammagrid.local/desktop/internal/viewmodel"
 )
-
-// --- Store read/write queries for option analytics ---
-
-func (s *Store) activeSource(ctx context.Context, ticker string) (string, error) {
-	m, err := s.meta(ctx, strings.ToUpper(ticker))
-	return m.Source, err
-}
-
-func (s *Store) latestMoment(ctx context.Context, ticker, source string) (string, error) {
-	where := "ticker = ?"
-	args := []any{strings.ToUpper(ticker)}
-	if source != "" {
-		where += " AND source = ?"
-		args = append(args, source)
-	}
-	q := fmt.Sprintf(`SELECT COALESCE(max(collected_at), '') FROM (
-		SELECT CAST(max(collected_at) AS TEXT) AS collected_at FROM option_snapshots WHERE %s
-		UNION ALL
-		SELECT CAST(max(collected_at) AS TEXT) FROM option_snapshots_archive WHERE %s
-	)`, where, where)
-	var at string
-	err := s.read.QueryRowContext(ctx, q, append(args, args...)...).Scan(&at)
-	return at, err
-}
-
-func (s *Store) collectionMoments(ctx context.Context, ticker, source string, days int, perDay bool) ([]string, error) {
-	where := "ticker = ? AND status = 'success' AND COALESCE(rows_fetched, 0) > 0"
-	args := []any{strings.ToUpper(ticker)}
-	if source != "" {
-		where += " AND source = ?"
-		args = append(args, source)
-	}
-	if days > 0 {
-		where += " AND started_at >= datetime('now', '-' || ? || ' days')"
-		args = append(args, days)
-	}
-	q := "SELECT CAST(started_at AS TEXT) FROM collection_runs WHERE " + where + " ORDER BY started_at DESC"
-	rows, err := s.read.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var moments []string
-	for rows.Next() {
-		var m string
-		if err := rows.Scan(&m); err != nil {
-			return nil, err
-		}
-		moments = append(moments, m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if !perDay {
-		return moments, nil
-	}
-	seen := make(map[string]bool)
-	var filtered []string
-	for _, m := range moments {
-		day := marketDayString(m)
-		if !seen[day] && sessionStartedAt(m) {
-			seen[day] = true
-			filtered = append(filtered, m)
-		}
-	}
-	return filtered, nil
-}
-
-const snapshotSelectCols = `ticker, CAST(collected_at AS TEXT) AS collected_at, underlying_price, substr(CAST(expiry AS TEXT),1,10) AS expiry, strike, option_type,
-	last_price, bid, ask, volume, open_interest, implied_volatility, COALESCE(in_the_money, 0) AS in_the_money,
-	delta, gamma, theta, vega, COALESCE(source, '') AS source, COALESCE(contract_symbol, '') AS contract_symbol, COALESCE(CAST(quote_timestamp AS TEXT), '') AS quote_timestamp`
-
-func scanStoredOptionRows(rows *sql.Rows) ([]StoredOptionRow, error) {
-	var out []StoredOptionRow
-	for rows.Next() {
-		var r StoredOptionRow
-		var last, bid, ask, vol, oi, iv, delta, gamma, theta, vega sql.NullFloat64
-		var itm int
-		if err := rows.Scan(
-			&r.Ticker, &r.CollectedAt, &r.UnderlyingPrice, &r.Expiry, &r.Strike, &r.OptionType,
-			&last, &bid, &ask, &vol, &oi, &iv, &itm,
-			&delta, &gamma, &theta, &vega, &r.Source, &r.ContractSymbol, &r.QuoteTimestamp,
-		); err != nil {
-			return nil, err
-		}
-		r.LastPrice = nullFloatPtr(last)
-		r.Bid = nullFloatPtr(bid)
-		r.Ask = nullFloatPtr(ask)
-		r.Volume = nullFloatPtr(vol)
-		r.OI = nullFloatPtr(oi)
-		r.IV = nullFloatPtr(iv)
-		r.ProviderIV = r.IV
-		r.InTheMoney = itm != 0
-		r.Delta = nullFloatPtr(delta)
-		r.Gamma = nullFloatPtr(gamma)
-		r.Theta = nullFloatPtr(theta)
-		r.Vega = nullFloatPtr(vega)
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-func nullFloatPtr(n sql.NullFloat64) *float64 {
-	if !n.Valid || math.IsNaN(n.Float64) || math.IsInf(n.Float64, 0) {
-		return nil
-	}
-	v := n.Float64
-	return &v
-}
-
-func (s *Store) snapshotsAt(ctx context.Context, ticker, source string, moments []string) ([]StoredOptionRow, error) {
-	if len(moments) == 0 {
-		return nil, nil
-	}
-	tkr := strings.ToUpper(ticker)
-	if len(moments) == 1 {
-		where := "ticker = ? AND collected_at = ?"
-		args := []any{tkr, moments[0]}
-		if source != "" {
-			where += " AND source = ?"
-			args = append(args, source)
-		}
-		q := fmt.Sprintf(`SELECT %s FROM option_snapshots WHERE %s
-			UNION ALL
-			SELECT %s FROM option_snapshots_archive WHERE %s
-			ORDER BY collected_at`, snapshotSelectCols, where, snapshotSelectCols, where)
-		rows, err := s.read.QueryContext(ctx, q, append(args, args...)...)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		return scanStoredOptionRows(rows)
-	}
-	momentsJSON, _ := json.Marshal(moments)
-	where := "ticker = ? AND collected_at IN (SELECT value FROM json_each(?))"
-	args := []any{tkr, string(momentsJSON)}
-	if source != "" {
-		where += " AND source = ?"
-		args = append(args, source)
-	}
-	q := fmt.Sprintf(`SELECT %s FROM option_snapshots WHERE %s
-		UNION ALL
-		SELECT %s FROM option_snapshots_archive WHERE %s
-		ORDER BY collected_at`, snapshotSelectCols, where, snapshotSelectCols, where)
-	rows, err := s.read.QueryContext(ctx, q, append(args, args...)...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanStoredOptionRows(rows)
-}
-
-func (s *Store) latestSnapshot(ctx context.Context, ticker, source string) (string, []StoredOptionRow, error) {
-	moment, err := s.latestMoment(ctx, ticker, source)
-	if err != nil || moment == "" {
-		return "", nil, err
-	}
-	rows, err := s.snapshotsAt(ctx, ticker, source, []string{moment})
-	return moment, rows, err
-}
-
-func (s *Store) collectionDepth(ctx context.Context) (map[string]string, error) {
-	rows, err := s.read.QueryContext(ctx, "SELECT ticker, date(min(collected_at)) FROM snapshot_iv_summary GROUP BY ticker")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := make(map[string]string)
-	for rows.Next() {
-		var tkr, d sql.NullString
-		if err := rows.Scan(&tkr, &d); err == nil && tkr.Valid && d.Valid {
-			out[strings.ToUpper(tkr.String)] = d.String
-		}
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) collectionState(ctx context.Context, ticker, source string) (string, int, error) {
-	rows, err := s.read.QueryContext(ctx,
-		`SELECT CAST(started_at AS TEXT), status, COALESCE(error_message, ''), COALESCE(rows_fetched, 0)
-		 FROM collection_runs
-		 WHERE ticker = ? AND (? = '' OR source = ?)
-		 ORDER BY started_at DESC`,
-		strings.ToUpper(ticker), source, source)
-	if err != nil {
-		return "", 0, err
-	}
-	defer rows.Close()
-	failures := 0
-	for rows.Next() {
-		var started, status, errMsg string
-		var count int
-		if err := rows.Scan(&started, &status, &errMsg, &count); err != nil {
-			return "", failures, err
-		}
-		if status == "success" && count > 0 {
-			return started, failures, nil
-		}
-		if status == "failed" && !isClosedMarketRefusal(started, errMsg) {
-			failures++
-		}
-	}
-	return "", failures, rows.Err()
-}
-
-func isClosedMarketRefusal(startedAt, errorMessage string) bool {
-	return errorMessage != "" &&
-		strings.Contains(errorMessage, "of contracts have open_interest=0") &&
-		marketStateFromClock(startedAt) == "closed"
-}
 
 func openSecondsBetween(start, end time.Time) float64 {
 	if !end.After(start) {
 		return 0
 	}
-	sLocal := start.In(marketZone)
-	eLocal := end.In(marketZone)
-	day := nyDay(sLocal)
-	endDay := nyDay(eLocal)
+	sLocal := start.In(marketclock.Zone)
+	eLocal := end.In(marketclock.Zone)
+	day := marketclock.Day(sLocal)
+	endDay := marketclock.Day(eLocal)
 	total := 0.0
 	for !day.After(endDay) {
-		if hrs, ok := nyseSessionHours(day); ok {
-			openAt, closeAt, okBounds := parseSessionBounds(day, hrs)
+		if hrs, ok := marketclock.Session(day); ok {
+			openAt, closeAt, okBounds := marketclock.SessionBounds(day, hrs)
 			if okBounds {
 				ovStart := openAt
 				if sLocal.After(ovStart) {
@@ -290,7 +80,7 @@ func assessFreshness(lastSuccess string, failures, intervalMinutes int, now time
 		}
 		return "ok", "数据正常"
 	}
-	lastTime, ok := parseAnyTime(lastSuccess)
+	lastTime, ok := marketclock.ParseTime(lastSuccess)
 	if !ok {
 		return "ok", "数据正常"
 	}
@@ -301,7 +91,7 @@ func assessFreshness(lastSuccess string, failures, intervalMinutes int, now time
 		return "err", fmt.Sprintf("Collection for this symbol is failing. The last %d attempts were refused; the newest data here is from %s ago. Other symbols are unaffected.", failures, agePhrase(gap))
 	}
 	if traded <= budget {
-		if marketStateFromClock(ref.Format(time.RFC3339)) == "closed" && gap > time.Hour {
+		if marketclock.MarketState(ref.Format(time.RFC3339)) == "closed" && gap > time.Hour {
 			return "ok", fmt.Sprintf("Market closed since the last collection (%s ago). The chain does not change until the next session.", agePhrase(gap))
 		}
 		return "ok", "数据正常"
@@ -310,13 +100,13 @@ func assessFreshness(lastSuccess string, failures, intervalMinutes int, now time
 }
 
 // buildRibbonPresolved builds RibbonData from a single snapshot whose rows have already run withSolvedIV.
-func buildRibbonPresolved(rows []StoredOptionRow, fullGEXMatrix *ExposureMatrix, r, q float64) RibbonData {
+func buildRibbonPresolved(ctx context.Context, rows []store.StoredOptionRow, r, q float64) viewmodel.RibbonData {
 	if len(rows) == 0 {
-		return RibbonData{}
+		return viewmodel.RibbonData{}
 	}
-	w := computeGammaWeatherPresolved(rows, r, q)
+	w := computeGammaWeatherPresolved(ctx, rows, r, q)
 	if w == nil {
-		return RibbonData{}
+		return viewmodel.RibbonData{}
 	}
 	spot := w.Spot
 	state := w.State
@@ -333,9 +123,9 @@ func buildRibbonPresolved(rows []StoredOptionRow, fullGEXMatrix *ExposureMatrix,
 	for _, e := range w.Expiries {
 		chosenWSet[e] = true
 	}
-	var weatherRows []StoredOptionRow
+	var weatherRows []store.StoredOptionRow
 	if len(chosenWSet) > 0 {
-		weatherRows = make([]StoredOptionRow, 0, len(rows))
+		weatherRows = make([]store.StoredOptionRow, 0, len(rows))
 		for i := range rows {
 			exp := rows[i].Expiry
 			if len(exp) >= 10 {
@@ -357,7 +147,7 @@ func buildRibbonPresolved(rows []StoredOptionRow, fullGEXMatrix *ExposureMatrix,
 		}
 	}
 
-	expMap := make(map[string][]StoredOptionRow)
+	expMap := make(map[string][]store.StoredOptionRow)
 	for i := range rows {
 		e := rows[i].Expiry
 		if len(e) >= 10 {
@@ -419,12 +209,12 @@ func buildRibbonPresolved(rows []StoredOptionRow, fullGEXMatrix *ExposureMatrix,
 	moveStr := "—"
 	movePctStr := ""
 	if move != nil {
-		moveStr = fmt.Sprintf("±%s", fmtPriceVal(move.Move, 2))
-		movePctStr = fmt.Sprintf("±%.2f%% · %s", move.MovePct, fmtExpiryShort(nearestExp))
+		moveStr = fmt.Sprintf("±%s", viewmodel.FmtPriceVal(move.Move, 2))
+		movePctStr = fmt.Sprintf("±%.2f%% · %s", move.MovePct, viewmodel.FmtExpiryShort(nearestExp))
 	}
 	maxPainExp := "—"
 	if nearestExp != "" {
-		maxPainExp = fmtExpiryShort(nearestExp)
+		maxPainExp = viewmodel.FmtExpiryShort(nearestExp)
 	}
 	pcrOIStr := "—"
 	if pcrOI != nil {
@@ -435,96 +225,35 @@ func buildRibbonPresolved(rows []StoredOptionRow, fullGEXMatrix *ExposureMatrix,
 		pcrVolStr = fmt.Sprintf("成交量 %.2f", *pcrVol)
 	}
 	netGEX := w.NetGEX
-	return RibbonData{
+	return viewmodel.RibbonData{
 		Spot:         spot,
-		SpotStr:      fmtPriceVal(spot, 2),
+		SpotStr:      viewmodel.FmtPriceVal(spot, 2),
 		State:        state,
 		StateCN:      cnPair[0],
 		StateSub:     cnPair[1],
 		Positive:     w.NetGEX >= 0,
 		Scope:        fmt.Sprintf("近 %d 天 · %d 到期日", w.HorizonDTE, w.ExpiryCount),
 		NetGEX:       &netGEX,
-		NetGEXStr:    fmtCompactVal(w.NetGEX, true, 2),
+		NetGEXStr:    viewmodel.FmtCompactVal(w.NetGEX, true, 2),
 		GammaFlip:    w.GammaFlip,
-		GammaFlipStr: fmtPrice(w.GammaFlip, 2),
+		GammaFlipStr: viewmodel.FmtPrice(w.GammaFlip, 2),
 		FlipDistStr:  flipDistStr,
-		CallGEXWall:  fmtStrikeLabel(callGEXWall),
-		PutGEXWall:   fmtStrikeLabel(putGEXWall),
-		CallOIWall:   fmtStrikeLabel(w.CallWall),
-		PutOIWall:    fmtStrikeLabel(w.PutWall),
-		MaxPain:      fmtStrikeLabel(mp),
+		CallGEXWall:  viewmodel.FmtStrikeLabel(callGEXWall),
+		PutGEXWall:   viewmodel.FmtStrikeLabel(putGEXWall),
+		CallOIWall:   viewmodel.FmtStrikeLabel(w.CallWall),
+		PutOIWall:    viewmodel.FmtStrikeLabel(w.PutWall),
+		MaxPain:      viewmodel.FmtStrikeLabel(mp),
 		MaxPainExp:   maxPainExp,
 		MoveStr:      moveStr,
 		MovePctStr:   movePctStr,
-		ATMIVStr:     fmtPct(atmIV, 1, false),
+		ATMIVStr:     viewmodel.FmtPct(atmIV, 1, false),
 		PCROIStr:     pcrOIStr,
 		PCRVolStr:    pcrVolStr,
 	}
 }
 
-func (s *DesktopService) buildSummaryJSON(ctx context.Context, ticker, source string) ([]byte, error) {
-	_, latest, err := s.store.latestSnapshot(ctx, ticker, source)
-	if err != nil {
-		return nil, err
-	}
-	if len(latest) == 0 {
-		return json.Marshal(TickerSummary{
-			Symbol:    ticker,
-			Source:    source,
-			HasData:   false,
-			NetGEXStr: "—",
-			StateCN:   "无数据",
-		})
-	}
-	withSolvedIV(latest, defaultRiskFreeRate, 0.0)
-	ribbon := buildRibbonPresolved(latest, nil, defaultRiskFreeRate, 0.0)
-	spot := ribbon.Spot
-	return json.Marshal(TickerSummary{
-		Symbol:    ticker,
-		Source:    source,
-		HasData:   true,
-		Spot:      &spot,
-		NetGEX:    ribbon.NetGEX,
-		NetGEXStr: ribbon.NetGEXStr,
-		State:     ribbon.State,
-		StateCN:   ribbon.StateCN,
-		Ribbon:    &ribbon,
-	})
-}
-
-func (s *DesktopService) buildViewJSON(ctx context.Context, path string, q url.Values) ([]byte, error) {
-	switch path {
-	case "/api/workbench":
-		res, err := s.buildWorkbenchGo(ctx, q)
-		if err != nil {
-			return nil, err
-		}
-		return json.Marshal(res)
-	case "/api/volatility":
-		res, err := s.buildVolatilityGo(ctx, q)
-		if err != nil {
-			return nil, err
-		}
-		return json.Marshal(res)
-	case "/api/contract":
-		res, err := s.buildContractGo(ctx, q)
-		if err != nil {
-			return nil, err
-		}
-		return json.Marshal(res)
-	case "/api/flow":
-		res, err := s.buildFlowGo(ctx, q)
-		if err != nil {
-			return nil, err
-		}
-		return json.Marshal(res)
-	default:
-		return nil, fmt.Errorf("未知视图: %s", path)
-	}
-}
-
 func fmtTimeMMDDHHMM(momentStr string) string {
-	if t, ok := parseAnyTime(momentStr); ok {
+	if t, ok := marketclock.ParseTime(momentStr); ok {
 		return t.UTC().Format("01-02 15:04")
 	}
 	if len(momentStr) >= 16 {
@@ -534,14 +263,14 @@ func fmtTimeMMDDHHMM(momentStr string) string {
 }
 
 func fmtMomentFull(momentStr string) string {
-	if t, ok := parseAnyTime(momentStr); ok {
+	if t, ok := marketclock.ParseTime(momentStr); ok {
 		return t.UTC().Format("2006-01-02 15:04:05")
 	}
 	return momentStr
 }
 
 func fmtMomentYYYYMMDDHHMM(momentStr string) string {
-	if t, ok := parseAnyTime(momentStr); ok {
+	if t, ok := marketclock.ParseTime(momentStr); ok {
 		return t.UTC().Format("2006-01-02 15:04")
 	}
 	if len(momentStr) >= 16 {
@@ -567,66 +296,43 @@ func percentileLinear(vals []float64, p float64) float64 {
 	return cp[lo] + frac*(cp[hi]-cp[lo])
 }
 
-// buildWorkbenchGo implements /api/workbench in pure Go.
-func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (WorkbenchResponse, error) {
-	ticker := strings.ToUpper(strings.TrimSpace(q.Get("ticker")))
-	if ticker == "" {
-		ticker = "SPY"
-	}
-	dimension := strings.ToLower(strings.TrimSpace(q.Get("dimension")))
+func (s *DesktopService) buildWorkbenchGo(ctx context.Context, m store.SnapshotMeta, live []store.StoredOptionRow, barVersion uint64, q workbenchQuery) (viewmodel.WorkbenchResponse, error) {
+	ticker, source, newestMoment := m.Ticker, m.Source, m.At
+	dimension, side, asOf := q.Dimension, q.Side, q.AsOf
 	if dimension != "gex" && dimension != "vanna" && dimension != "charm" {
 		dimension = "gex"
 	}
-	side := strings.ToLower(strings.TrimSpace(q.Get("side")))
-	if side != "net" && side != "call" && side != "put" {
+	if side != "call" && side != "put" {
 		side = "net"
 	}
-	asOf := strings.TrimSpace(q.Get("as_of"))
-	nExpiries, err := strconv.Atoi(q.Get("n_expiries"))
-	if err != nil || nExpiries <= 0 {
+	nExpiries, strikesEach, strikeRangePct := q.Expiries, q.Strikes, q.RangePct
+	if nExpiries <= 0 {
 		nExpiries = 12
 	}
-	strikesEach, err := strconv.Atoi(q.Get("strikes"))
-	if err != nil || strikesEach <= 0 {
+	if strikesEach <= 0 {
 		strikesEach = 20
 	}
-	strikeRangePct := 0.0
-	if q.Has("range_pct") {
-		strikeRangePct, err = strconv.ParseFloat(q.Get("range_pct"), 64)
-		if err != nil || math.IsNaN(strikeRangePct) || math.IsInf(strikeRangePct, 0) || strikeRangePct < 1 || strikeRangePct > 50 {
-			return WorkbenchResponse{}, fmt.Errorf("行权价范围须为现价的 ±1%% 至 ±50%%")
-		}
-	}
 
-	source, err := s.store.activeSource(ctx, ticker)
-	if err != nil {
-		return WorkbenchResponse{}, err
-	}
-	newestMoment, latestRows, err := s.store.latestSnapshot(ctx, ticker, source)
-	if err != nil {
-		return WorkbenchResponse{}, err
-	}
-	if asOf == "" {
-		s.intradayMu.Lock()
-		live := s.liveSnapshots[ticker]
-		s.intradayMu.Unlock()
-		if len(live) > 0 && live[0].CollectedAt > newestMoment {
-			cp := make([]StoredOptionRow, len(live))
-			copy(cp, live)
-			latestRows = cp
-			newestMoment = cp[0].CollectedAt
+	latestRows := live
+	if len(live) > 0 {
+		newestMoment, source = live[0].CollectedAt, live[0].Source
+	} else {
+		snapshot, err := s.snapshot(ctx, m)
+		if err != nil {
+			return viewmodel.WorkbenchResponse{}, err
 		}
+		latestRows = snapshot.rows
 	}
 	srcLabel := strings.ToUpper(source)
 	if srcLabel == "" {
 		srcLabel = "—"
 	}
 	if len(latestRows) == 0 {
-		return WorkbenchResponse{
+		return viewmodel.WorkbenchResponse{
 			Ticker:    ticker,
 			Source:    srcLabel,
 			Empty:     true,
-			Moments:   []MomentOption{},
+			Moments:   []viewmodel.MomentOption{},
 			Strikes:   []float64{},
 			Expiries:  []string{},
 			Totals:    []float64{},
@@ -635,16 +341,20 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 			CellsNorm: [][]float64{},
 			CellsTip:  [][]string{},
 			Profile:   []float64{},
-			Board:     []ExpiryBoardRow{},
+			Board:     []viewmodel.ExpiryBoardRow{},
 		}, nil
 	}
 
-	withSolvedIV(latestRows, defaultRiskFreeRate, 0.0)
-	ribbon := buildRibbonPresolved(latestRows, nil, defaultRiskFreeRate, 0.0)
-
-	moments, err := s.store.collectionMoments(ctx, ticker, source, snapshotHistoryDays(), false)
+	ribbonMeta := m
+	ribbonMeta.At, ribbonMeta.Source = newestMoment, source
+	ribbon, err := s.snapshotRibbon(ctx, ribbonMeta, latestRows)
 	if err != nil {
-		return WorkbenchResponse{}, err
+		return viewmodel.WorkbenchResponse{}, err
+	}
+
+	moments, err := s.store.CollectionMoments(ctx, ticker, source, snapshotHistoryDays(), false)
+	if err != nil {
+		return viewmodel.WorkbenchResponse{}, err
 	}
 	newest := newestMoment
 	if len(moments) > 0 {
@@ -663,25 +373,26 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 			}
 		}
 		if found && chosenMoment != newestMoment {
-			snap, err := s.store.snapshotsAt(ctx, ticker, source, []string{chosenMoment})
-			if err == nil && len(snap) > 0 {
-				withSolvedIV(snap, defaultRiskFreeRate, 0.0)
-				snapshotRows = snap
+			historical := m
+			historical.At = chosenMoment
+			snap, err := s.snapshot(ctx, historical)
+			if err == nil && len(snap.rows) > 0 {
+				snapshotRows = snap.rows
 			} else {
 				chosenMoment = newestMoment
 			}
 		}
 	}
 
-	lastSuccess, failures, _ := s.store.collectionState(ctx, ticker, source)
-	intervalRaw, _ := s.store.setting(ctx, "collector_interval_minutes")
-	intervalMin, _ := strconv.Atoi(intervalRaw)
-	dot, statusNote := assessFreshness(lastSuccess, failures, intervalMin, s.now())
+	if err := ctx.Err(); err != nil {
+		return viewmodel.WorkbenchResponse{}, err
+	}
+	dot, statusNote := "rest", "本地快照 · 手动刷新"
 
 	spot := snapshotRows[0].UnderlyingPrice
 
 	// Group snapshot rows by expiry and filter to tradeable expiries (years_to_expiry > 0).
-	expRowsMap := make(map[string][]StoredOptionRow, 32)
+	expRowsMap := make(map[string][]store.StoredOptionRow, 32)
 	for i := range snapshotRows {
 		exp := snapshotRows[i].Expiry
 		if len(exp) >= 10 {
@@ -717,9 +428,9 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 		shownSet[e] = true
 	}
 
-	callRows := make([]StoredOptionRow, 0, len(snapshotRows)/2+1)
-	putRows := make([]StoredOptionRow, 0, len(snapshotRows)/2+1)
-	shownSnapshotRows := make([]StoredOptionRow, 0, len(snapshotRows))
+	callRows := make([]store.StoredOptionRow, 0, len(snapshotRows)/2+1)
+	putRows := make([]store.StoredOptionRow, 0, len(snapshotRows)/2+1)
+	shownSnapshotRows := make([]store.StoredOptionRow, 0, len(snapshotRows))
 	for i := range snapshotRows {
 		exp := snapshotRows[i].Expiry
 		if len(exp) >= 10 {
@@ -735,9 +446,18 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 		}
 	}
 
-	fullNetMat := buildExposureMatrixPresolved(snapshotRows, dimension, shownSet, defaultRiskFreeRate, 0.0)
-	callMat := buildExposureMatrixPresolved(callRows, dimension, shownSet, defaultRiskFreeRate, 0.0)
-	putMat := buildExposureMatrixPresolved(putRows, dimension, shownSet, defaultRiskFreeRate, 0.0)
+	if err := ctx.Err(); err != nil {
+		return viewmodel.WorkbenchResponse{}, err
+	}
+	fullNetMat := buildExposureMatrixPresolved(ctx, snapshotRows, dimension, shownSet, defaultRiskFreeRate, 0.0)
+	if err := ctx.Err(); err != nil {
+		return viewmodel.WorkbenchResponse{}, err
+	}
+	callMat := buildExposureMatrixPresolved(ctx, callRows, dimension, shownSet, defaultRiskFreeRate, 0.0)
+	if err := ctx.Err(); err != nil {
+		return viewmodel.WorkbenchResponse{}, err
+	}
+	putMat := buildExposureMatrixPresolved(ctx, putRows, dimension, shownSet, defaultRiskFreeRate, 0.0)
 
 	displayFull := fullNetMat
 	if side == "call" {
@@ -750,7 +470,10 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 	if dimension == "gex" {
 		gexMat = fullNetMat
 	} else {
-		gexMat = buildExposureMatrixPresolved(snapshotRows, "gex", shownSet, defaultRiskFreeRate, 0.0)
+		gexMat = buildExposureMatrixPresolved(ctx, snapshotRows, "gex", shownSet, defaultRiskFreeRate, 0.0)
+	}
+	if err := ctx.Err(); err != nil {
+		return viewmodel.WorkbenchResponse{}, err
 	}
 	flip := gammaFlipFromMatrix(gexMat, spot)
 	callWall, putWall := dealerWalls(shownSnapshotRows, shownSet)
@@ -772,7 +495,7 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 	var strikeLower, strikeUpper *float64
 	if strikeRangePct > 0 {
 		if spot <= 0 || math.IsNaN(spot) || math.IsInf(spot, 0) {
-			return WorkbenchResponse{}, fmt.Errorf("当前快照缺少有效现价，无法计算百分比范围")
+			return viewmodel.WorkbenchResponse{}, fmt.Errorf("当前快照缺少有效现价，无法计算百分比范围")
 		}
 		halfWidth := spot * strikeRangePct / 100
 		strikeLower, strikeUpper = floatPtr(spot-halfWidth), floatPtr(spot+halfWidth)
@@ -849,6 +572,9 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 		bandedCells[si] = row
 	}
 
+	if err := ctx.Err(); err != nil {
+		return viewmodel.WorkbenchResponse{}, err
+	}
 	// Lookup maps for callMat and putMat by (strike, expiry) plus OI and volume.
 	type seKey struct {
 		strike float64
@@ -911,26 +637,10 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 	colTotalsStr := make([]string, nCols)
 	for idx, v := range colTotals {
 		grandTotal += v
-		colTotalsStr[idx] = fmtCompactVal(v, true, 2)
+		colTotalsStr[idx] = viewmodel.FmtCompactVal(v, true, 2)
 	}
 
 	// Compute vmax as 92nd percentile of abs(non-zero finite values in bandedCells).
-	var nonZeroAbs []float64
-	for si := range bandedCells {
-		for _, v := range bandedCells[si] {
-			if !math.IsNaN(v) && !math.IsInf(v, 0) && v != 0 {
-				nonZeroAbs = append(nonZeroAbs, math.Abs(v))
-			}
-		}
-	}
-	vmax := 1.0
-	if len(nonZeroAbs) > 0 {
-		vmax = percentileLinear(nonZeroAbs, 92.0)
-		if vmax <= 0 {
-			vmax = 1.0
-		}
-	}
-
 	profile := make([]float64, len(bandedStrikes))
 	profileStr := make([]string, len(bandedStrikes))
 	callProfile := make([]float64, len(bandedStrikes))
@@ -961,11 +671,11 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 			pOISum += ov.putOI
 		}
 		profile[si] = rowSum
-		profileStr[si] = fmtCompactVal(rowSum, true, 2)
+		profileStr[si] = viewmodel.FmtCompactVal(rowSum, true, 2)
 		callProfile[si] = cSum
-		callProfileStr[si] = fmtCompactVal(cSum, true, 2)
+		callProfileStr[si] = viewmodel.FmtCompactVal(cSum, true, 2)
 		putProfile[si] = pSum
-		putProfileStr[si] = fmtCompactVal(pSum, true, 2)
+		putProfileStr[si] = viewmodel.FmtCompactVal(pSum, true, 2)
 		strikeCallOI[si] = fmtVolCompact(cOISum)
 		strikePutOI[si] = fmtVolCompact(pOISum)
 		if a := math.Abs(rowSum); a > profileMax {
@@ -976,8 +686,8 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 	expLabels := make([]string, nCols)
 	expDTEs := make([]string, nCols)
 	for idx, exp := range activeExpiries {
-		expLabels[idx] = fmtExpiryShort(exp)
-		expDTEs[idx] = fmt.Sprintf("%dd", calcDTE(exp, chosenMoment))
+		expLabels[idx] = viewmodel.FmtExpiryShort(exp)
+		expDTEs[idx] = fmt.Sprintf("%dd", viewmodel.CalcDTE(exp, chosenMoment))
 	}
 
 	strikeLabels := make([]string, len(bandedStrikes))
@@ -987,7 +697,7 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 	cellsTip := make([][]string, len(bandedStrikes))
 
 	for si, k := range bandedStrikes {
-		strikeLabels[si] = fmtStrikeVal(k)
+		strikeLabels[si] = viewmodel.FmtStrikeVal(k)
 		var tags []string
 		if callGEXWall != nil && math.Abs(k-*callGEXWall) < 1e-6 {
 			tags = append(tags, "◆C")
@@ -1006,111 +716,135 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 		}
 		strikeTags[si] = strings.Join(tags, " ")
 
-		tRow := make([]string, nCols)
-		nRow := make([]float64, nCols)
-		tipRow := make([]string, nCols)
-		for idx, exp := range activeExpiries {
-			val := bandedCells[si][idx]
-			if math.IsNaN(val) {
-				tRow[idx] = ""
-				nRow[idx] = 0.0
-			} else if val == 0 {
-				tRow[idx] = "·"
-				nRow[idx] = 0.0
-			} else {
-				tRow[idx] = fmtCellCompact(val)
-				norm := val / vmax
-				if norm < -1.0 {
-					norm = -1.0
-				} else if norm > 1.0 {
-					norm = 1.0
-				}
-				nRow[idx] = norm
-			}
-			sk := seKey{k, exp}
-			cv := callValMap[sk]
-			pv := putValMap[sk]
-			ov := oiVolMap[sk]
-			valForTip := val
-			if math.IsNaN(valForTip) {
-				valForTip = 0
-			}
-			tipRow[idx] = fmt.Sprintf(
-				"K %s · %s\n%s 净: %s (Call %s / Put %s)\nOI: C %s / P %s · 成交量: %s",
-				fmtStrikeVal(k), expLabels[idx],
-				dimensionCN[dimension], fmtCompactVal(valForTip, true, 2),
-				fmtCompactVal(cv, true, 2), fmtCompactVal(pv, true, 2),
-				formatIntComma(int64(ov.callOI)), formatIntComma(int64(ov.putOI)), formatIntComma(int64(ov.vol)),
-			)
-		}
-		cellsText[si] = tRow
-		cellsNorm[si] = nRow
-		cellsTip[si] = tipRow
 	}
-
-	// Expiry structure board iterates over shownExpiries.
-	board := make([]ExpiryBoardRow, 0, len(shownExpiries))
-	for _, exp := range shownExpiries {
-		eRows := expRowsMap[exp]
-		var cGEX, pGEX, cOI, pOI float64
-		for i := range eRows {
-			r := &eRows[i]
-			v, ok := rowExposure(r, "gex", defaultRiskFreeRate, 0.0)
-			if ok && !math.IsNaN(v) {
+	if strikeRangePct == 0 {
+		var nonZeroAbs []float64
+		for _, row := range bandedCells {
+			for _, v := range row {
+				if !math.IsNaN(v) && !math.IsInf(v, 0) && v != 0 {
+					nonZeroAbs = append(nonZeroAbs, math.Abs(v))
+				}
+			}
+		}
+		vmax := 1.0
+		if len(nonZeroAbs) > 0 {
+			vmax = percentileLinear(nonZeroAbs, 92.0)
+			if vmax <= 0 {
+				vmax = 1
+			}
+		}
+		for si, k := range bandedStrikes {
+			tRow := make([]string, nCols)
+			nRow := make([]float64, nCols)
+			tipRow := make([]string, nCols)
+			for idx, exp := range activeExpiries {
+				val := bandedCells[si][idx]
+				if math.IsNaN(val) {
+					tRow[idx] = ""
+					nRow[idx] = 0.0
+				} else if val == 0 {
+					tRow[idx] = "·"
+					nRow[idx] = 0.0
+				} else {
+					tRow[idx] = viewmodel.FmtCellCompact(val)
+					norm := val / vmax
+					if norm < -1.0 {
+						norm = -1.0
+					} else if norm > 1.0 {
+						norm = 1.0
+					}
+					nRow[idx] = norm
+				}
+				sk := seKey{k, exp}
+				cv := callValMap[sk]
+				pv := putValMap[sk]
+				ov := oiVolMap[sk]
+				valForTip := val
+				if math.IsNaN(valForTip) {
+					valForTip = 0
+				}
+				tipRow[idx] = fmt.Sprintf(
+					"K %s · %s\n%s 净: %s (Call %s / Put %s)\nOI: C %s / P %s · 成交量: %s",
+					viewmodel.FmtStrikeVal(k), expLabels[idx],
+					dimensionCN[dimension], viewmodel.FmtCompactVal(valForTip, true, 2),
+					viewmodel.FmtCompactVal(cv, true, 2), viewmodel.FmtCompactVal(pv, true, 2),
+					formatIntComma(int64(ov.callOI)), formatIntComma(int64(ov.putOI)), formatIntComma(int64(ov.vol)),
+				)
+			}
+			cellsText[si] = tRow
+			cellsNorm[si] = nRow
+			cellsTip[si] = tipRow
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return viewmodel.WorkbenchResponse{}, err
+	}
+	var board []viewmodel.ExpiryBoardRow
+	if strikeRangePct == 0 {
+		// Expiry structure board iterates over shownExpiries.
+		board = make([]viewmodel.ExpiryBoardRow, 0, len(shownExpiries))
+		for _, exp := range shownExpiries {
+			eRows := expRowsMap[exp]
+			var cGEX, pGEX, cOI, pOI float64
+			for i := range eRows {
+				r := &eRows[i]
+				v, ok := rowExposure(r, "gex", defaultRiskFreeRate, 0.0)
+				if ok && !math.IsNaN(v) {
+					if r.OptionType == "call" {
+						cGEX += v
+					} else if r.OptionType == "put" {
+						pGEX += v
+					}
+				}
 				if r.OptionType == "call" {
-					cGEX += v
+					cOI += valOrZero(r.OI)
 				} else if r.OptionType == "put" {
-					pGEX += v
+					pOI += valOrZero(r.OI)
 				}
 			}
-			if r.OptionType == "call" {
-				cOI += valOrZero(r.OI)
-			} else if r.OptionType == "put" {
-				pOI += valOrZero(r.OI)
+			netG := cGEX + pGEX
+			mp := maxPain(eRows)
+			mv := expectedMovePresolved(eRows, spot)
+			var atmIV *float64
+			moveStr := "—"
+			movePctStr := "—"
+			if mv != nil {
+				v := mv.ATMIV
+				atmIV = &v
+				moveStr = fmt.Sprintf("±%s", viewmodel.FmtPriceVal(mv.Move, 2))
+				movePctStr = fmt.Sprintf("±%.2f%%", mv.MovePct)
 			}
+			pcrStr := "—"
+			if cOI > 0 {
+				pcrStr = fmt.Sprintf("%.2f", pOI/cOI)
+			}
+			board = append(board, viewmodel.ExpiryBoardRow{
+				Expiry:     viewmodel.FmtExpiryShort(exp),
+				ExpiryISO:  exp,
+				DTE:        viewmodel.CalcDTE(exp, chosenMoment),
+				NetGEX:     netG,
+				NetGEXStr:  viewmodel.FmtCompactVal(netG, true, 2),
+				CallGEXStr: viewmodel.FmtCompactVal(cGEX, true, 2),
+				PutGEXStr:  viewmodel.FmtCompactVal(pGEX, true, 2),
+				MaxPain:    viewmodel.FmtStrikeLabel(mp),
+				ATMIV:      viewmodel.FmtPct(atmIV, 1, false),
+				Move:       moveStr,
+				MovePct:    movePctStr,
+				CallOI:     formatIntComma(int64(cOI)),
+				PutOI:      formatIntComma(int64(pOI)),
+				PCR:        pcrStr,
+				Contracts:  contractsBackingExpiry(eRows),
+			})
 		}
-		netG := cGEX + pGEX
-		mp := maxPain(eRows)
-		mv := expectedMovePresolved(eRows, spot)
-		var atmIV *float64
-		moveStr := "—"
-		movePctStr := "—"
-		if mv != nil {
-			v := mv.ATMIV
-			atmIV = &v
-			moveStr = fmt.Sprintf("±%s", fmtPriceVal(mv.Move, 2))
-			movePctStr = fmt.Sprintf("±%.2f%%", mv.MovePct)
-		}
-		pcrStr := "—"
-		if cOI > 0 {
-			pcrStr = fmt.Sprintf("%.2f", pOI/cOI)
-		}
-		board = append(board, ExpiryBoardRow{
-			Expiry:     fmtExpiryShort(exp),
-			ExpiryISO:  exp,
-			DTE:        calcDTE(exp, chosenMoment),
-			NetGEX:     netG,
-			NetGEXStr:  fmtCompactVal(netG, true, 2),
-			CallGEXStr: fmtCompactVal(cGEX, true, 2),
-			PutGEXStr:  fmtCompactVal(pGEX, true, 2),
-			MaxPain:    fmtStrikeLabel(mp),
-			ATMIV:      fmtPct(atmIV, 1, false),
-			Move:       moveStr,
-			MovePct:    movePctStr,
-			CallOI:     formatIntComma(int64(cOI)),
-			PutOI:      formatIntComma(int64(pOI)),
-			PCR:        pcrStr,
-			Contracts:  contractsBackingExpiry(eRows),
-		})
-	}
 
-	momentOpts := make([]MomentOption, 0, len(moments))
+	}
+	momentOpts := make([]viewmodel.MomentOption, 0, len(moments))
 	for _, m := range moments {
 		suffix := ""
 		if m == newest {
 			suffix = " (最新)"
 		}
-		momentOpts = append(momentOpts, MomentOption{
+		momentOpts = append(momentOpts, viewmodel.MomentOption{
 			Value: fmtMomentFull(m),
 			Label: fmtTimeMMDDHHMM(m) + suffix,
 		})
@@ -1133,9 +867,19 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 		uniqSet[uniqKey{r.Expiry, r.Strike, r.OptionType}] = true
 	}
 
-	intraday := s.buildIntradaySummary(ctx, ticker, source, chosenMoment, snapshotRows)
+	var intraday viewmodel.IntradaySummary
+	if strikeRangePct == 0 {
+		key := fmt.Sprintf("intraday/%s/%s/%s/%s/%d", ticker, source, chosenMoment, s.marketEpoch(), barVersion)
+		intraday, err = cached(s.cache, ctx, key, func(task context.Context) (viewmodel.IntradaySummary, error) {
+			result := s.buildIntradaySummary(task, ticker, source, chosenMoment, snapshotRows)
+			return result, task.Err()
+		})
+		if err != nil {
+			return viewmodel.WorkbenchResponse{}, err
+		}
+	}
 
-	return WorkbenchResponse{
+	return viewmodel.WorkbenchResponse{
 		Ticker:         ticker,
 		Source:         srcLabel,
 		Empty:          false,
@@ -1146,7 +890,7 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 		ContractsCount: len(uniqSet),
 		Dot:            dot,
 		StatusNote:     statusNote,
-		Ribbon:         ribbon,
+		Ribbon:         *ribbon,
 		Dimension:      dimension,
 		DimensionCN:    dimensionCN[dimension],
 		UnitCN:         unitCN[dimension],
@@ -1169,7 +913,7 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 		Totals:         colTotals,
 		TotalsStr:      colTotalsStr,
 		GrandTotal:     grandTotal,
-		GrandTotalStr:  fmtCompactVal(grandTotal, true, 2),
+		GrandTotalStr:  viewmodel.FmtCompactVal(grandTotal, true, 2),
 		CellsText:      cellsText,
 		CellsNorm:      cellsNorm,
 		CellsTip:       cellsTip,
@@ -1187,41 +931,29 @@ func (s *DesktopService) buildWorkbenchGo(ctx context.Context, q url.Values) (Wo
 	}, nil
 }
 
-// buildVolatilityGo implements /api/volatility in pure Go.
-func (s *DesktopService) buildVolatilityGo(ctx context.Context, q url.Values) (VolatilityResponse, error) {
-	ticker := strings.ToUpper(strings.TrimSpace(q.Get("ticker")))
-	if ticker == "" {
-		ticker = "SPY"
-	}
-	widthPct, err := strconv.ParseFloat(q.Get("width"), 64)
-	if err != nil || widthPct <= 0 {
-		widthPct = 12.0
-	}
-	source, err := s.store.activeSource(ctx, ticker)
+func (s *DesktopService) buildVolatilityGo(ctx context.Context, m store.SnapshotMeta, widthPct float64) (viewmodel.VolatilityResponse, error) {
+	ticker, source, chosenMoment := m.Ticker, m.Source, m.At
+	snapshot, err := s.snapshot(ctx, m)
 	if err != nil {
-		return VolatilityResponse{}, err
+		return viewmodel.VolatilityResponse{}, err
 	}
-	chosenMoment, latestRows, err := s.store.latestSnapshot(ctx, ticker, source)
-	if err != nil {
-		return VolatilityResponse{}, err
-	}
+	latestRows := snapshot.rows
 	if len(latestRows) == 0 {
-		return VolatilityResponse{
+		return viewmodel.VolatilityResponse{
 			Ticker:    ticker,
 			Empty:     true,
-			Skew:      []SkewCurve{},
-			Term:      []TermPoint{},
-			IVHistory: []IVHistoryPoint{},
-			RV:        []RVItem{},
+			Skew:      []viewmodel.SkewCurve{},
+			Term:      []viewmodel.TermPoint{},
+			IVHistory: []viewmodel.IVHistoryPoint{},
+			RV:        []viewmodel.RVItem{},
 		}, nil
 	}
 
-	withSolvedIV(latestRows, defaultRiskFreeRate, 0.0)
 	spot := latestRows[0].UnderlyingPrice
 	lo := spot * (1.0 - widthPct/100.0)
 	hi := spot * (1.0 + widthPct/100.0)
 
-	expRowsMap := make(map[string][]StoredOptionRow)
+	expRowsMap := make(map[string][]store.StoredOptionRow)
 	for i := range latestRows {
 		exp := latestRows[i].Expiry
 		if len(exp) >= 10 {
@@ -1237,7 +969,7 @@ func (s *DesktopService) buildVolatilityGo(ctx context.Context, q url.Values) (V
 	}
 	sort.Strings(expiries)
 
-	skew := make([]SkewCurve, 0, 5)
+	skew := make([]viewmodel.SkewCurve, 0, 5)
 	skewExps := expiries
 	if len(skewExps) > 5 {
 		skewExps = skewExps[:5]
@@ -1272,16 +1004,16 @@ func (s *DesktopService) buildVolatilityGo(ctx context.Context, q url.Values) (V
 			for i, k := range strikes {
 				ivs[i] = strikeIV[k].sum / float64(strikeIV[k].cnt)
 			}
-			dte := calcDTE(exp, chosenMoment)
-			skew = append(skew, SkewCurve{
-				Label:   fmt.Sprintf("%s (%dd)", fmtExpiryShort(exp), dte),
+			dte := viewmodel.CalcDTE(exp, chosenMoment)
+			skew = append(skew, viewmodel.SkewCurve{
+				Label:   fmt.Sprintf("%s (%dd)", viewmodel.FmtExpiryShort(exp), dte),
 				Strikes: strikes,
 				IVs:     ivs,
 			})
 		}
 	}
 
-	term := make([]TermPoint, 0, 24)
+	term := make([]viewmodel.TermPoint, 0, 24)
 	termExps := expiries
 	if len(termExps) > 24 {
 		termExps = termExps[:24]
@@ -1294,9 +1026,9 @@ func (s *DesktopService) buildVolatilityGo(ctx context.Context, q url.Values) (V
 			if len(lbl) >= 10 {
 				lbl = lbl[5:10]
 			}
-			term = append(term, TermPoint{
+			term = append(term, viewmodel.TermPoint{
 				Label:   lbl,
-				DTE:     calcDTE(exp, chosenMoment),
+				DTE:     viewmodel.CalcDTE(exp, chosenMoment),
 				ATMIV:   mv.ATMIV,
 				MovePct: mv.MovePct,
 				Move:    mv.Move,
@@ -1304,10 +1036,18 @@ func (s *DesktopService) buildVolatilityGo(ctx context.Context, q url.Values) (V
 		}
 	}
 
-	ivHist, _ := s.store.ivWeightedAverageSeries(ctx, ticker, source, snapshotHistoryDays())
-	rvList, _ := s.store.realizedVolatilityItems(ctx, ticker)
+	ivPoints, _ := s.store.IvWeightedAverageSeries(ctx, ticker, source, snapshotHistoryDays())
+	ivHist := make([]viewmodel.IVHistoryPoint, 0, len(ivPoints))
+	for _, p := range ivPoints {
+		ivHist = append(ivHist, viewmodel.IVHistoryPoint{Time: fmtTimeMMDDHHMM(p.At), IV: p.IV})
+	}
+	rvPoints, _ := s.store.RealizedVolatilityItems(ctx, ticker)
+	rvList := make([]viewmodel.RVItem, 0, len(rvPoints))
+	for _, p := range rvPoints {
+		rvList = append(rvList, viewmodel.RVItem{Window: fmt.Sprintf("RV%dd", p.WindowDays), Value: viewmodel.FmtPctVal(p.Value, 1, false), Raw: p.Value})
+	}
 
-	return VolatilityResponse{
+	return viewmodel.VolatilityResponse{
 		Ticker:    ticker,
 		Empty:     false,
 		Spot:      spot,
@@ -1316,58 +1056,4 @@ func (s *DesktopService) buildVolatilityGo(ctx context.Context, q url.Values) (V
 		IVHistory: ivHist,
 		RV:        rvList,
 	}, nil
-}
-
-func (s *Store) ivWeightedAverageSeries(ctx context.Context, ticker, source string, days int) ([]IVHistoryPoint, error) {
-	where := "ticker = ?"
-	args := []any{strings.ToUpper(ticker)}
-	if source != "" {
-		where += " AND source = ?"
-		args = append(args, source)
-	}
-	if days > 0 {
-		where += " AND collected_at >= datetime('now', '-' || ? || ' days')"
-		args = append(args, days)
-	}
-	rows, err := s.read.QueryContext(ctx,
-		"SELECT CAST(collected_at AS TEXT), iv_weighted_avg FROM snapshot_iv_summary WHERE "+where+" ORDER BY collected_at",
-		args...)
-	if err != nil {
-		return []IVHistoryPoint{}, err
-	}
-	defer rows.Close()
-	out := []IVHistoryPoint{}
-	for rows.Next() {
-		var t string
-		var v sql.NullFloat64
-		if err := rows.Scan(&t, &v); err == nil && v.Valid && !math.IsNaN(v.Float64) {
-			out = append(out, IVHistoryPoint{Time: fmtTimeMMDDHHMM(t), IV: v.Float64})
-		}
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) realizedVolatilityItems(ctx context.Context, ticker string) ([]RVItem, error) {
-	rows, err := s.read.QueryContext(ctx,
-		`SELECT window_days, value FROM realized_volatility
-		 WHERE ticker = ? AND as_of_date = (SELECT max(as_of_date) FROM realized_volatility WHERE ticker = ?)
-		 ORDER BY window_days`,
-		strings.ToUpper(ticker), strings.ToUpper(ticker))
-	if err != nil {
-		return []RVItem{}, err
-	}
-	defer rows.Close()
-	out := []RVItem{}
-	for rows.Next() {
-		var w int
-		var v float64
-		if err := rows.Scan(&w, &v); err == nil && !math.IsNaN(v) {
-			out = append(out, RVItem{
-				Window: fmt.Sprintf("RV%dd", w),
-				Value:  fmtPctVal(v, 1, false),
-				Raw:    v,
-			})
-		}
-	}
-	return out, rows.Err()
 }

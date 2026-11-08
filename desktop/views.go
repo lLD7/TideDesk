@@ -5,6 +5,8 @@ import (
 	"math"
 	"strings"
 
+	"gammagrid.local/desktop/internal/viewmodel"
+
 	"github.com/egoist/mygo/ui"
 )
 
@@ -124,7 +126,7 @@ func (a *DesktopApp) renderWorkbenchView(c *ui.Context) {
 	})
 }
 
-func (a *DesktopApp) renderExposureMatrixCard(c *ui.Context, wb *WorkbenchResponse) {
+func (a *DesktopApp) renderExposureMatrixCard(c *ui.Context, wb *viewmodel.WorkbenchResponse) {
 	ui.Column(c).Padding(8, 12).Gap(6).Radius(8).
 		Background(colorSurface).Border(1, colorBorder).Children(func() {
 		// Compact Header Row with Quick Jump to Strike Cumulative Pressure View
@@ -290,7 +292,7 @@ func (a *DesktopApp) renderExposureMatrixCard(c *ui.Context, wb *WorkbenchRespon
 	})
 }
 
-func (a *DesktopApp) renderExpiryBoardCard(c *ui.Context, wb *WorkbenchResponse) {
+func (a *DesktopApp) renderExpiryBoardCard(c *ui.Context, wb *viewmodel.WorkbenchResponse) {
 	rows := wb.Board
 	sectionCard(c, "到期日全景面板 (Expiry Term Board)", fmt.Sprintf("%d 个到期日", len(rows)), func() {
 		cols := []ui.TableColumn{
@@ -399,7 +401,7 @@ func (a *DesktopApp) renderVolatilityView(c *ui.Context) {
 	})
 }
 
-func (a *DesktopApp) drawSkewChart(c *ui.Context, vol *VolatilityResponse) {
+func (a *DesktopApp) drawSkewChart(c *ui.Context, vol *viewmodel.VolatilityResponse) {
 	palette := []ui.Color{colorFlip, colorPos, colorSpot, colorNeg, colorVol}
 	ui.Column(c).Gap(6).Children(func() {
 		// Legend row
@@ -505,7 +507,7 @@ func (a *DesktopApp) drawSkewChart(c *ui.Context, vol *VolatilityResponse) {
 	})
 }
 
-func (a *DesktopApp) drawTermChart(c *ui.Context, vol *VolatilityResponse) {
+func (a *DesktopApp) drawTermChart(c *ui.Context, vol *viewmodel.VolatilityResponse) {
 	ui.Column(c).Gap(6).Children(func() {
 		ui.Row(c).Gap(14).Children(func() {
 			ui.Row(c).AlignItems(ui.Center).Gap(5).Children(func() {
@@ -584,7 +586,7 @@ func (a *DesktopApp) drawTermChart(c *ui.Context, vol *VolatilityResponse) {
 	})
 }
 
-func (a *DesktopApp) drawIVHistoryChart(c *ui.Context, vol *VolatilityResponse) {
+func (a *DesktopApp) drawIVHistoryChart(c *ui.Context, vol *viewmodel.VolatilityResponse) {
 	pts := vol.IVHistory
 	if len(pts) < 2 {
 		ui.Text(c, "历史采样点不足（当前仅 1 次快照，持续定时采集后将自动绘出 IV 历史曲线）").
@@ -820,7 +822,7 @@ func (a *DesktopApp) renderChainView(c *ui.Context) {
 	})
 }
 
-func (a *DesktopApp) renderContractDetailCard(c *ui.Context, ct *ContractResponse) {
+func (a *DesktopApp) renderContractDetailCard(c *ui.Context, ct *viewmodel.ContractResponse) {
 	sectionCard(c, "单合约深度追踪 · "+ct.Name, fmt.Sprintf("%d 个快照样本", ct.Samples), func() {
 		ui.Row(c).Gap(14).AlignItems(ui.Center).Wrap().Children(func() {
 			kv := func(k, v string, col ui.Color) {
@@ -844,9 +846,10 @@ func (a *DesktopApp) renderContractDetailCard(c *ui.Context, ct *ContractRespons
 				strk := ct.Strike
 				tp := ct.Type
 				go func() {
-					_ = a.api.postJSON("/api/pin", map[string]any{
-						"ticker": sym, "expiry": exp, "strike": strk, "type": tp,
-					}, nil)
+					if err := a.service.pin(a.service.ctx, sym, exp, strk, tp); err != nil {
+						a.update(func() { a.statusMsg = err.Error() })
+						return
+					}
 					a.refreshAll()
 				}()
 			}
@@ -1022,7 +1025,7 @@ func (a *DesktopApp) renderFlowView(c *ui.Context) {
 	})
 }
 
-func (a *DesktopApp) drawPCRChart(c *ui.Context, pts []PCRPoint) {
+func (a *DesktopApp) drawPCRChart(c *ui.Context, pts []viewmodel.PCRPoint) {
 	if len(pts) < 2 {
 		ui.Text(c, "需要至少 2 次快照以绘制 Put/Call Ratio 走势曲线").FontSize(11.5).TextColor(colorMuted).Padding(8)
 		return
@@ -1122,15 +1125,12 @@ func (a *DesktopApp) renderLogsView(c *ui.Context) {
 				if ui.Button(c, "备份数据库").Disabled(a.collecting).Clicked() {
 					a.statusMsg = "正在备份数据库…"
 					go func() {
-						var result struct {
-							Path string `json:"path"`
-						}
-						err := a.api.postJSON("/api/backup", map[string]any{}, &result)
+						path, err := a.service.backup(a.service.ctx)
 						a.update(func() {
 							if err != nil {
 								a.statusMsg = "备份失败: " + err.Error()
 							} else {
-								a.statusMsg = "备份已保存: " + result.Path
+								a.statusMsg = "备份已保存: " + path
 							}
 						})
 					}()

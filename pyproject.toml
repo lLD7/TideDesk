@@ -1,9 +1,0 @@
-[tool.ruff]
-target-version = "py312"
-line-length = 130
-
-[tool.ruff.lint]
-select = ["E", "F", "I"]
-
-[tool.pytest.ini_options]
-python_files = ["test_desktop.py"]

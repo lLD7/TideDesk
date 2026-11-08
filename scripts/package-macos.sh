@@ -2,15 +2,14 @@
 # Build signed MyGo updates and a first-install DMG; no app launch or tests.
 set -euo pipefail
 TIDE_ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
-TIDE_PYTHON="$TIDE_ROOT/.venv/bin/python"
-TIDE_VERSION="$("$TIDE_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$TIDE_ROOT/desktop/mygo.json")"
 if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
   echo 'Build this edition on an Apple Silicon Mac.' >&2
   exit 1
 fi
+TIDE_VERSION="$(go -C "$TIDE_ROOT/scripts" run ./release version)"
 mkdir -p "$TIDE_ROOT/build" "$TIDE_ROOT/dist"
 uv python install 3.12.15 --install-dir "$TIDE_ROOT/build/python-cache" --no-bin --no-config
-"$TIDE_PYTHON" "$TIDE_ROOT/scripts/prepare-release.py"
+go -C "$TIDE_ROOT/scripts" run ./release build
 TIDE_OUTPUT="$TIDE_ROOT/dist/mygo/darwin-arm64"
 TIDE_STAGE="$(mktemp -d "$TIDE_ROOT/build/tidedesk-dmg.XXXXXX")"
 ditto "$TIDE_OUTPUT/TideDesk.app" "$TIDE_STAGE/TideDesk.app"

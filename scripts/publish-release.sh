@@ -1,11 +1,10 @@
 #!/bin/bash
-# Export only prepare-release.py's source allowlist. Existing releases are
+# Export only the Go release tool's source allowlist. Existing releases are
 # never silently overwritten; private data and signing keys never enter Git.
 set -euo pipefail
 TIDE_ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
-TIDE_PYTHON="$TIDE_ROOT/.venv/bin/python"
 TIDE_REPO='lLD7/TideDesk'
-TIDE_VERSION="$("$TIDE_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$TIDE_ROOT/desktop/mygo.json")"
+TIDE_VERSION="$(go -C "$TIDE_ROOT/scripts" run ./release version)"
 if [[ "$(gh api user --jq .login)" != 'lLD7' ]]; then
   echo 'Log in to GitHub as lLD7 before publishing.' >&2
   exit 1
@@ -19,6 +18,7 @@ for tide_asset in "TideDesk-$TIDE_VERSION-macOS-AppleSilicon.dmg" "TideDesk-$TID
   [[ -f "$TIDE_ROOT/dist/$tide_asset" ]] || { echo "Missing release artifact: $tide_asset" >&2; exit 1; }
 done
 TIDE_STAGE="$(mktemp -d "$TIDE_ROOT/build/tidedesk-publish.XXXXXX")"
+go -C "$TIDE_ROOT/scripts" run ./release notes > "$TIDE_STAGE/notes.md"
 unzip -q "$TIDE_ROOT/dist/TideDesk-$TIDE_VERSION-Source.zip" -d "$TIDE_STAGE/source"
 TIDE_GIT="$TIDE_STAGE/repo"
 git init -b main "$TIDE_GIT"
@@ -35,13 +35,6 @@ git -C "$TIDE_GIT" -c user.name=lLD7 -c user.email=119817306+lLD7@users.noreply.
   commit -m "Release TideDesk $TIDE_VERSION"
 git -C "$TIDE_GIT" -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin main
 TIDE_SHA="$(git -C "$TIDE_GIT" rev-parse HEAD)"
-"$TIDE_PYTHON" - "$TIDE_ROOT/desktop/CHANGELOG.md" "$TIDE_VERSION" "$TIDE_STAGE/notes.md" <<'PY'
-from pathlib import Path
-import sys
-text=Path(sys.argv[1]).read_text()
-section=text.split('## '+sys.argv[2]+'\n',1)[1].split('\n## ',1)[0].strip()
-Path(sys.argv[3]).write_text(section+'\n')
-PY
 gh release create "v$TIDE_VERSION" --repo "$TIDE_REPO" --draft --target "$TIDE_SHA" \
   --title "TideDesk $TIDE_VERSION" --notes-file "$TIDE_STAGE/notes.md"
 TIDE_ASSETS=("$TIDE_ROOT/dist/TideDesk-$TIDE_VERSION-macOS-AppleSilicon.dmg"
