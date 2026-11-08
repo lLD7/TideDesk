@@ -1,0 +1,23 @@
+{
+  "name": "TideDesk",
+  "slug": "tidedesk",
+  "identifier": "local.gammagrid.desktop",
+  "version": "0.9.0",
+  "license": "AGPL-3.0-only",
+  "main": ".",
+  "out": "../dist/mygo",
+  "icon": "assets/TideDesk-1024.png",
+  "resources": ["../build/tidedesk-resources/gex", "../build/tidedesk-resources/ThirdPartyLicenses", "../LICENSE"],
+  "macos": {
+    "minimumSystemVersion": "14.0",
+    "signingIdentity": "-",
+    "icon": "assets/TideDesk.icns",
+    "infoPlist": {"LSApplicationCategoryType": "public.app-category.finance"}
+  },
+  "updates": {
+    "publicKey": "iAYulSLMi6+UPx+PvBsRYVpjaOVIcrB8CWr1Fh2J1iQ=",
+    "github": "lLD7/TideDesk",
+    "changelog": "CHANGELOG.md",
+    "deltas": 3
+  }
+}
