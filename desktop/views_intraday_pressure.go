@@ -8,6 +8,8 @@ import (
 	"gammagrid.local/desktop/internal/viewmodel"
 
 	"github.com/egoist/mygo/ui"
+	"github.com/lobehub/lobe-mygo/pkg/display"
+	"github.com/lobehub/lobe-mygo/pkg/theme"
 )
 
 // ============================================================================
@@ -123,33 +125,8 @@ func (a *DesktopApp) renderIntradayVolumeCanvas(c *ui.Context, ticker string, ba
 		return
 	}
 
-	maxVol := 1.0
-	minSpot, maxSpot := math.Inf(1), math.Inf(-1)
-	for _, b := range bars {
-		if b.TotalVol > maxVol {
-			maxVol = b.TotalVol
-		}
-		if b.Spot > 0 {
-			if b.Spot < minSpot {
-				minSpot = b.Spot
-			}
-			if b.Spot > maxSpot {
-				maxSpot = b.Spot
-			}
-		}
-	}
-	maxVol *= 1.12
-	if math.IsInf(minSpot, 1) || math.IsInf(maxSpot, -1) {
-		minSpot, maxSpot = 99, 101
-	} else if math.Abs(maxSpot-minSpot) < 1e-4 {
-		pad := math.Max(1.0, minSpot*0.005)
-		minSpot -= pad
-		maxSpot += pad
-	} else {
-		pad := (maxSpot - minSpot) * 0.14
-		minSpot -= pad
-		maxSpot += pad
-	}
+	data := a.intradayPlotFor(bars)
+	maxVol, minSpot, maxSpot := data.maxVolume, data.minSpot, data.maxSpot
 
 	box := ui.Box(c).FillWidth().Height(262).Background(ui.RGB(10, 13, 19))
 	px, _, hasPointer := box.PointerPosition()
@@ -166,24 +143,17 @@ func (a *DesktopApp) renderIntradayVolumeCanvas(c *ui.Context, ticker string, ba
 		}
 
 		// Horizontal grid lines + Left (Volume) & Right (Spot Price) Y-axis labels
-		const yTicks = 5
+		const yTicks = plotTickCount - 1
 		for i := 0; i <= yTicks; i++ {
 			frac := float32(i) / float32(yTicks)
 			yy := plotY + plotH*(1-frac)
 			p.Line(plotX, yy, plotX+plotW, yy, 1, colorHair)
 
-			volVal := maxVol * float64(frac)
-			vLbl := fmtVolCompact(volVal)
-			if i == 0 {
-				vLbl = "0"
-			}
-			spL := ui.Span{Text: vLbl, Font: "monospace", Size: 9.5, Color: colorMuted}
+			spL := ui.Span{Text: data.volumeTicks[i], Font: "monospace", Size: 9.5, Color: colorMuted}
 			twL, thL := p.MeasureText(0, spL)
 			p.RichText(plotX-twL-5, yy-thL*0.5, 0, spL)
 
-			spotVal := minSpot + (maxSpot-minSpot)*float64(frac)
-			sLbl := fmt.Sprintf("$%.2f", spotVal)
-			spR := ui.Span{Text: sLbl, Font: "monospace", Size: 9.5, Color: colorMuted}
+			spR := ui.Span{Text: data.spotTicks[i], Font: "monospace", Size: 9.5, Color: colorMuted}
 			_, thR := p.MeasureText(0, spR)
 			p.RichText(plotX+plotW+5, yy-thR*0.5, 0, spR)
 		}
@@ -212,7 +182,7 @@ func (a *DesktopApp) renderIntradayVolumeCanvas(c *ui.Context, ticker string, ba
 		}, ui.RGBA(255, 255, 255, 0.08), 0)
 
 		// Draw Stacked Bars: bottom = CallVol (green), top = PutVol (red)
-		spotPts := make([][2]float32, 0, n)
+		spotPts := data.volumeSpot[:0]
 		labelStep := max(1, n/6)
 		for i, b := range bars {
 			cx := plotX + (float32(i)+0.5)*slotW
@@ -249,25 +219,31 @@ func (a *DesktopApp) renderIntradayVolumeCanvas(c *ui.Context, ticker string, ba
 			}
 		}
 
-		// Draw Spot Price Line (Yellow)
+		data.volumeSpot = spotPts
+
+		// Draw Spot Price Line (Amber with neon glow)
 		if len(spotPts) >= 2 && !isStrikeMode {
-			p.StrokePolyline(spotPts, 2.1, colorSpot)
+			p.StrokePolyline(spotPts, 4.2, colorSpot.Alpha(0.22))
+			p.StrokePolyline(spotPts, 2.0, colorSpot)
 		} else if len(spotPts) == 1 {
 			sy := spotPts[0][1]
-			p.Line(plotX, sy, plotX+plotW, sy, 1.3, colorSpot.Alpha(0.55))
+			p.Line(plotX, sy, plotX+plotW, sy, 3.0, colorSpot.Alpha(0.18))
+			p.Line(plotX, sy, plotX+plotW, sy, 1.4, colorSpot.Alpha(0.75))
 		}
 
 		// Draw Glowing Spot Dot on Active Bar
-		if activeIdx >= 0 && activeIdx < len(spotPts) {
-			pt := spotPts[activeIdx]
-			p.Fill(ui.Rect{X: pt[0] - 6.5, Y: pt[1] - 6.5, W: 13, H: 13}, colorSpot.Alpha(0.28), 6.5)
-			p.Fill(ui.Rect{X: pt[0] - 4, Y: pt[1] - 4, W: 8, H: 8}, colorSpot, 4)
+		if spot := bars[activeIdx].Spot; spot > 0 {
+			sy := plotY + plotH*(1-float32((spot-minSpot)/(maxSpot-minSpot)))
+			pt := [2]float32{activeCenterX, sy}
+			p.Fill(ui.Rect{X: pt[0] - 8, Y: pt[1] - 8, W: 16, H: 16}, colorSpot.Alpha(0.25), 8)
+			p.Fill(ui.Rect{X: pt[0] - 4.5, Y: pt[1] - 4.5, W: 9, H: 9}, colorSpot, 4.5)
+			p.Fill(ui.Rect{X: pt[0] - 2, Y: pt[1] - 2, W: 4, H: 4}, ui.RGB(255, 255, 255), 2)
 		}
 
-		// Draw Floating Tooltip Card (matching Screenshot 1 dark box with red/rose border)
-		if activeIdx >= 0 && activeIdx < n {
+		// Keep the detail card tied to the pointer rather than covering the chart at rest.
+		if hasPointer && px >= padL && px <= padL+plotW {
 			b := bars[activeIdx]
-			cardW, cardH := float32(228), float32(114)
+			cardW, cardH := float32(234), float32(116)
 			cardX := activeCenterX - cardW - 12
 			if cardX < plotX+8 {
 				cardX = min(plotX+plotW-cardW-8, activeCenterX+12)
@@ -278,11 +254,11 @@ func (a *DesktopApp) renderIntradayVolumeCanvas(c *ui.Context, ticker string, ba
 			cardY := plotY + 10
 
 			cardRect := ui.Rect{X: cardX, Y: cardY, W: cardW, H: cardH}
-			p.Fill(cardRect, ui.RGBA(8, 10, 15, 0.94), 6)
-			p.Stroke(cardRect, colorNeg.Alpha(0.78), 6, 1.1)
+			p.Fill(cardRect, ui.RGBA(9, 12, 18, 0.96), 7)
+			p.Stroke(cardRect, colorNeg.Alpha(0.7), 7, 1.1)
 
-			tx := cardX + 10
-			ty := cardY + 7
+			tx := cardX + 11
+			ty := cardY + 8
 			p.RichText(tx, ty, cardW-16, ui.Span{Text: b.WindowLabel, Font: "monospace", Size: 10, Weight: 600, Color: colorText})
 
 			ty += 17
@@ -299,7 +275,7 @@ func (a *DesktopApp) renderIntradayVolumeCanvas(c *ui.Context, ticker string, ba
 			p.RichText(tx+9, ty, cardW-20, ui.Span{Text: fmt.Sprintf("%s: %.2f", ticker, b.Spot), Font: "monospace", Size: 10, Color: colorSpot})
 
 			ty += 16
-			p.RichText(tx, ty, cardW-16, ui.Span{Text: fmt.Sprintf("P/C Ratio: %.3f", b.PCRatio), Font: "monospace", Size: 10, Color: colorMuted})
+			p.RichText(tx, ty, cardW-16, ui.Span{Text: fmt.Sprintf("5 min P/C Ratio: %.3f", b.PCRatio), Font: "monospace", Size: 10, Color: colorMuted})
 
 			ty += 16
 			p.RichText(tx, ty, cardW-16, ui.Span{Text: fmt.Sprintf("Candle volume: %s", formatIntComma(int64(math.Round(b.TotalVol)))), Font: "monospace", Size: 10, Color: colorText})
@@ -374,48 +350,9 @@ func (a *DesktopApp) renderWeeklyDTETideCanvas(c *ui.Context, ticker string, bar
 		return
 	}
 
-	minVal, maxVal := 0.0, 0.0
-	minSpot, maxSpot := math.Inf(1), math.Inf(-1)
-	for _, b := range bars {
-		cVal := b.CumWeeklyCall
-		pVal := -b.CumWeeklyPut
-		nVal := b.CumWeeklyNet
-		for _, v := range []float64{cVal, pVal, nVal, b.WeeklyNetPrem} {
-			if v < minVal {
-				minVal = v
-			}
-			if v > maxVal {
-				maxVal = v
-			}
-		}
-		if b.Spot > 0 {
-			if b.Spot < minSpot {
-				minSpot = b.Spot
-			}
-			if b.Spot > maxSpot {
-				maxSpot = b.Spot
-			}
-		}
-	}
-	span := maxVal - minVal
-	if span < 1.0 {
-		maxVal += 1000
-		minVal -= 1000
-	} else {
-		maxVal += span * 0.12
-		minVal -= span * 0.12
-	}
-	if math.IsInf(minSpot, 1) || math.IsInf(maxSpot, -1) {
-		minSpot, maxSpot = 99, 101
-	} else if math.Abs(maxSpot-minSpot) < 1e-4 {
-		pad := math.Max(1.0, minSpot*0.005)
-		minSpot -= pad
-		maxSpot += pad
-	} else {
-		pad := (maxSpot - minSpot) * 0.14
-		minSpot -= pad
-		maxSpot += pad
-	}
+	data := a.intradayPlotFor(bars)
+	minVal, maxVal := data.minTide, data.maxTide
+	minSpot, maxSpot := data.minSpot, data.maxSpot
 
 	box := ui.Box(c).FillWidth().Height(262).Background(ui.RGB(10, 13, 19))
 	px, _, hasPointer := box.PointerPosition()
@@ -437,19 +374,17 @@ func (a *DesktopApp) renderWeeklyDTETideCanvas(c *ui.Context, ticker string, bar
 		}
 		zeroY := valToY(0)
 
-		const yTicks = 5
+		const yTicks = plotTickCount - 1
 		for i := 0; i <= yTicks; i++ {
 			frac := float32(i) / float32(yTicks)
 			yy := plotY + plotH*(1-frac)
 			p.Line(plotX, yy, plotX+plotW, yy, 1, colorHair)
 
-			v := minVal + (maxVal-minVal)*float64(frac)
-			spL := ui.Span{Text: fmtDollarCompact(v, true), Font: "monospace", Size: 9.5, Color: colorMuted}
+			spL := ui.Span{Text: data.tideTicks[i], Font: "monospace", Size: 9.5, Color: colorMuted}
 			twL, thL := p.MeasureText(0, spL)
 			p.RichText(plotX-twL-5, yy-thL*0.5, 0, spL)
 
-			spotVal := minSpot + (maxSpot-minSpot)*float64(frac)
-			spR := ui.Span{Text: fmt.Sprintf("$%.2f", spotVal), Font: "monospace", Size: 9.5, Color: colorMuted}
+			spR := ui.Span{Text: data.spotTicks[i], Font: "monospace", Size: 9.5, Color: colorMuted}
 			_, thR := p.MeasureText(0, spR)
 			p.RichText(plotX+plotW+5, yy-thR*0.5, 0, spR)
 		}
@@ -479,10 +414,10 @@ func (a *DesktopApp) renderWeeklyDTETideCanvas(c *ui.Context, ticker string, bar
 			H: plotH,
 		}, ui.RGBA(255, 255, 255, 0.07), 0)
 
-		callPts := make([][2]float32, 0, n)
-		putPts := make([][2]float32, 0, n)
-		netPts := make([][2]float32, 0, n)
-		spotPts := make([][2]float32, 0, n)
+		callPts := data.weekly[0][:0]
+		putPts := data.weekly[1][:0]
+		netPts := data.weekly[2][:0]
+		spotPts := data.weekly[3][:0]
 		labelStep := max(1, n/6)
 
 		for i, b := range bars {
@@ -511,16 +446,21 @@ func (a *DesktopApp) renderWeeklyDTETideCanvas(c *ui.Context, ticker string, bar
 			}
 		}
 
+		data.weekly = [4][][2]float32{callPts, putPts, netPts, spotPts}
+
 		if len(callPts) >= 2 {
-			p.StrokePolyline(callPts, 1.7, colorPos.Alpha(0.88))
-			p.StrokePolyline(putPts, 1.7, colorNeg.Alpha(0.88))
-			p.StrokePolyline(netPts, 2.4, colorFlip)
+			p.StrokePolyline(callPts, 1.8, colorPos.Alpha(0.9))
+			p.StrokePolyline(putPts, 1.8, colorNeg.Alpha(0.9))
+			// Luminous glow for Net Tide
+			p.StrokePolyline(netPts, 4.4, colorFlip.Alpha(0.24))
+			p.StrokePolyline(netPts, 2.2, colorFlip)
 		} else if len(netPts) == 1 {
 			p.Fill(ui.Rect{X: callPts[0][0] - 4, Y: callPts[0][1] - 4, W: 8, H: 8}, colorPos, 4)
 			p.Fill(ui.Rect{X: putPts[0][0] - 4, Y: putPts[0][1] - 4, W: 8, H: 8}, colorNeg, 4)
 			p.Fill(ui.Rect{X: netPts[0][0] - 5, Y: netPts[0][1] - 5, W: 10, H: 10}, colorFlip, 5)
 		}
 		if len(spotPts) >= 2 && !isStrikeMode {
+			p.StrokePolyline(spotPts, 3.6, colorSpot.Alpha(0.2))
 			p.StrokePolyline(spotPts, 1.8, colorSpot.Alpha(0.9))
 		}
 
@@ -532,6 +472,9 @@ func (a *DesktopApp) renderWeeklyDTETideCanvas(c *ui.Context, ticker string, bar
 			p.Fill(ui.Rect{X: cp[0] - 3.5, Y: cp[1] - 3.5, W: 7, H: 7}, colorPos, 3.5)
 			p.Fill(ui.Rect{X: pp[0] - 3.5, Y: pp[1] - 3.5, W: 7, H: 7}, colorNeg, 3.5)
 
+			if !hasPointer || px < padL || px > padL+plotW {
+				return
+			}
 			b := bars[activeIdx]
 			cardW, cardH := float32(234), float32(100)
 			cardX := activeCenterX - cardW - 12
@@ -655,12 +598,24 @@ func (a *DesktopApp) renderStrikePressureView(c *ui.Context) {
 
 			ui.Spacer(c)
 
-			ui.Badge(c, fmt.Sprintf("区间合力 %s", wb.GrandTotalStr)).Background(colorCard).TextColor(colorText)
+			display.Tag(c, fmt.Sprintf("区间合力 %s", wb.GrandTotalStr), display.TagProps{
+				Variant: display.TagFilled,
+				Color:   display.TagGray,
+				Size:    theme.Small,
+			})
 			if wb.Ribbon.CallGEXWall != "" && wb.Ribbon.CallGEXWall != "—" {
-				ui.Badge(c, "◆C 墙 "+wb.Ribbon.CallGEXWall).Background(colorPos.Alpha(0.16)).TextColor(colorPos)
+				display.Tag(c, "◆C 墙 "+wb.Ribbon.CallGEXWall, display.TagProps{
+					Variant: display.TagFilled,
+					Color:   display.TagGreen,
+					Size:    theme.Small,
+				})
 			}
 			if wb.Ribbon.PutGEXWall != "" && wb.Ribbon.PutGEXWall != "—" {
-				ui.Badge(c, "◆P 墙 "+wb.Ribbon.PutGEXWall).Background(colorNeg.Alpha(0.16)).TextColor(colorNeg)
+				display.Tag(c, "◆P 墙 "+wb.Ribbon.PutGEXWall, display.TagProps{
+					Variant: display.TagFilled,
+					Color:   display.TagRed,
+					Size:    theme.Small,
+				})
 			}
 		})
 
@@ -709,44 +664,8 @@ func (a *DesktopApp) renderStrikePressureChartCard(c *ui.Context, wb *viewmodel.
 			return
 		}
 
-		maxAbs := 1.0
-		for i := 0; i < n; i++ {
-			vNet := math.Abs(wb.Profile[i])
-			var vC, vP float64
-			if i < len(wb.CallProfile) {
-				vC = math.Abs(wb.CallProfile[i])
-			}
-			if i < len(wb.PutProfile) {
-				vP = math.Abs(wb.PutProfile[i])
-			}
-			for _, v := range []float64{vNet, vC, vP} {
-				if v > maxAbs {
-					maxAbs = v
-				}
-			}
-		}
-
-		cumNet := make([]float64, n)
-		maxCumAbs := 1.0
-		if n > 1 && wb.Strikes[0] > wb.Strikes[n-1] {
-			acc := 0.0
-			for i := n - 1; i >= 0; i-- {
-				acc += wb.Profile[i]
-				cumNet[i] = acc
-				if math.Abs(acc) > maxCumAbs {
-					maxCumAbs = math.Abs(acc)
-				}
-			}
-		} else {
-			acc := 0.0
-			for i := 0; i < n; i++ {
-				acc += wb.Profile[i]
-				cumNet[i] = acc
-				if math.Abs(acc) > maxCumAbs {
-					maxCumAbs = math.Abs(acc)
-				}
-			}
-		}
+		data := a.pressurePlotFor(wb)
+		maxAbs := data.maxBar
 
 		rowH := float32(24)
 		canvasH := max(float32(420), float32(n)*rowH+28)
@@ -767,6 +686,10 @@ func (a *DesktopApp) renderStrikePressureChartCard(c *ui.Context, wb *viewmodel.
 				}
 				midX := plotX + plotW*0.5
 				stepY := plotH / float32(max(1, n))
+				first, end := visiblePlotRows(p.Visible(), plotY, stepY, n)
+				if first >= end {
+					return
+				}
 
 				for _, frac := range []float32{-1.0, -0.5, 0, 0.5, 1.0} {
 					gx := midX + frac*(plotW*0.46)
@@ -787,9 +710,7 @@ func (a *DesktopApp) renderStrikePressureChartCard(c *ui.Context, wb *viewmodel.
 					}
 				}
 
-				cumPts := make([][2]float32, 0, n)
-
-				for i := 0; i < n; i++ {
+				for i := first; i < end; i++ {
 					ry := plotY + float32(i)*stepY
 					cy := ry + stepY*0.5
 					strike := wb.Strikes[i]
@@ -837,8 +758,6 @@ func (a *DesktopApp) renderStrikePressureChartCard(c *ui.Context, wb *viewmodel.
 								p.Fill(ui.Rect{X: midX - w, Y: cy - barH*0.5, W: w, H: barH}, colorNeg.Alpha(0.86), 2.5)
 							}
 						}
-						cxPt := midX + float32(cumNet[i]/maxCumAbs)*halfW
-						cumPts = append(cumPts, [2]float32{cxPt, cy})
 
 						valCol := colorPos
 						if val < 0 {
@@ -915,9 +834,16 @@ func (a *DesktopApp) renderStrikePressureChartCard(c *ui.Context, wb *viewmodel.
 					}
 				}
 
-				if a.pressureModeIdx == 0 && len(cumPts) >= 2 {
-					p.StrokePolyline(cumPts, 2.0, colorFlip)
-					for _, pt := range cumPts {
+				if a.pressureModeIdx == 0 && n > 1 {
+					points := data.points[:0]
+					for i := max(0, first-1); i < min(n, end+1); i++ {
+						x := midX + float32(data.running[i]/data.maxRunning)*(plotW*0.46)
+						y := plotY + (float32(i)+0.5)*stepY
+						points = append(points, [2]float32{x, y})
+					}
+					data.points = points
+					p.StrokePolyline(points, 2, colorFlip)
+					for _, pt := range points {
 						p.Fill(ui.Rect{X: pt[0] - 2.5, Y: pt[1] - 2.5, W: 5, H: 5}, colorFlip, 2.5)
 					}
 				}

@@ -74,6 +74,7 @@ func run() error {
 	}
 	service := newDesktopService(database, root)
 	service.Start()
+
 	var shutdown sync.Once
 	cleanup := func() { shutdown.Do(func() { service.Close(); database.Close() }) }
 	defer cleanup()
@@ -88,18 +89,17 @@ func run() error {
 		offWake = observeSystemWake(service.wakeScheduler)
 		app := NewDesktopApp(service)
 		app.win = mygo.NewWindow(mygo.WindowOptions{
-			Title:                "TideDesk",
-			Width:                1480,
-			Height:               940,
-			MinWidth:             1080,
-			MinHeight:            680,
-			TitleBarStyle:        mygo.TitleBarHidden,
-			TrafficLightPosition: &mygo.Point{X: 15, Y: 15},
-			Transparent:          true,
-			Vibrancy:             mygo.VibrancySidebar,
-			BackgroundColor:      "#090B0F",
-			StateKey:             "main",
-			Content:              ui.View(app.view),
+			Title:           "TideDesk",
+			Width:           1480,
+			Height:          940,
+			MinWidth:        1080,
+			MinHeight:       680,
+			TitleBarStyle:   mygo.TitleBarHiddenInset,
+			Transparent:     true,
+			Vibrancy:        mygo.VibrancySidebar,
+			BackgroundColor: "#080A0E",
+			StateKey:        "main",
+			Content:         ui.View(app.view),
 		})
 		configureUpdateMenu(app)
 		app.refreshAll()

@@ -14,59 +14,100 @@ import (
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+	"github.com/lobehub/lobe-mygo/pkg/action"
+	"github.com/lobehub/lobe-mygo/pkg/display"
+	"github.com/lobehub/lobe-mygo/pkg/lucide"
+	"github.com/lobehub/lobe-mygo/pkg/theme"
 )
 
 const (
-	titleBarHeight = 46
-	sidebarWidth   = 230
+	titleBarHeight = 48
+	sidebarWidth   = 240
 )
 
 var (
-	colorBg      = ui.RGB(9, 11, 15)
-	colorSurface = ui.RGB(14, 18, 25)
-	colorCard    = ui.RGB(19, 25, 35)
-	colorHover   = ui.RGB(26, 34, 48)
-	colorBorder  = ui.RGBA(255, 255, 255, 0.08)
-	colorHair    = ui.RGBA(255, 255, 255, 0.05)
+	colorBg      = ui.RGB(8, 10, 14)
+	colorSurface = ui.RGB(13, 17, 24)
+	colorCard    = ui.RGB(18, 23, 33)
+	colorChrome  ui.Color
+	colorHover   = ui.RGB(24, 31, 44)
+	colorBorder  = ui.RGBA(255, 255, 255, 0.075)
+	colorHair    = ui.RGBA(255, 255, 255, 0.04)
 
-	colorText  = ui.RGB(232, 236, 242)
-	colorMuted = ui.RGB(138, 148, 166)
-	colorFaint = ui.RGB(88, 98, 116)
+	colorText  = ui.RGB(241, 245, 251)
+	colorMuted = ui.RGB(142, 153, 171)
+	colorFaint = ui.RGB(74, 85, 104)
 
-	colorPos    = ui.RGB(47, 214, 160)
-	colorNeg    = ui.RGB(255, 92, 147)
-	colorSpot   = ui.RGB(255, 181, 71)
-	colorFlip   = ui.RGB(110, 168, 254)
+	colorPos    = ui.RGB(46, 211, 183) // mint-emerald Call/Positive
+	colorNeg    = ui.RGB(255, 92, 147) // vivid rose-crimson Put/Negative
+	colorSpot   = ui.RGB(245, 166, 35) // luminous amber Spot
+	colorFlip   = ui.RGB(99, 102, 241) // modern indigo Gamma Flip
 	colorAccent = colorFlip
-	colorVol    = ui.RGB(167, 139, 250)
-	colorWarn   = ui.RGB(242, 193, 78)
-	colorErr    = ui.RGB(255, 107, 107)
+	colorVol    = ui.RGB(167, 139, 250) // soft purple IV
+	colorWarn   = ui.RGB(245, 158, 11)
+	colorErr    = ui.RGB(244, 63, 94)
 )
 
-func pulseTheme() *ui.Theme {
+func init() {
+	tok := theme.Dark()
+	colorBg = tok.BgLayout
+	colorSurface = tok.BgContainer
+	colorCard = tok.BgElevated
+	colorHover = tok.FillSecondary
+	colorBorder = tok.Border
+	colorHair = tok.BorderSecondary
+	colorText = tok.Text
+	colorChrome = colorSurface.Mix(colorText, 0.045)
+	colorMuted = tok.TextSecondary
+	colorFaint = tok.TextTertiary
+	colorPos = tok.Success
+	colorNeg = tok.Error
+	colorWarn = tok.Warning
+}
+
+var sharedPulseTheme = buildPulseTheme()
+
+func buildPulseTheme() *ui.Theme {
 	t := *ui.DarkTheme()
-	t.Background = colorBg
-	t.Surface = colorCard
-	t.SurfaceHover = colorHover
-	t.SurfacePressed = ui.RGB(32, 42, 58)
-	t.Border = colorBorder
-	t.Text = colorText
-	t.TextMuted = colorMuted
-	t.Accent = colorFlip
-	t.AccentHover = ui.RGB(132, 182, 255)
-	t.AccentPressed = ui.RGB(88, 148, 245)
-	t.AccentText = ui.RGB(8, 12, 18)
-	t.InactiveAccent = ui.RGB(50, 62, 82)
-	t.Success = colorPos
-	t.Danger = colorNeg
-	t.Warning = colorWarn
-	t.Radius = 7
+	tok := theme.Dark()
+	t.Background = tok.BgLayout
+	t.Surface = tok.BgContainer
+	t.SurfaceHover = tok.FillSecondary
+	t.SurfacePressed = tok.BgContainerSecondary
+	t.Border = tok.Border
+	t.Text = tok.Text
+	t.TextMuted = tok.TextSecondary
+	t.Accent = tok.Primary
+	t.AccentHover = tok.PrimaryHover
+	t.AccentPressed = tok.PrimaryActive
+	t.AccentText = tok.BgLayout
+	t.InactiveAccent = tok.Border
+	t.Success = tok.Success
+	t.Danger = tok.Error
+	t.Warning = tok.Warning
+	t.Radius = 8
 	t.Spacing = 3.5
 	t.FontSize = 12.5
 	t.Scrollbar = ui.RGBA(255, 255, 255, 0.16)
 	t.ScrollbarWidth = 6
 	t.TooltipDelay = 250 * time.Millisecond
 	return &t
+}
+
+func (a *DesktopApp) windowTheme(prefs ui.Preferences) *ui.Theme {
+	accent := prefs.Accent
+	if accent.A == 0 {
+		accent = sharedPulseTheme.Accent
+	}
+	if a.windowPalette == nil || a.windowPalette.Accent != accent {
+		t := *sharedPulseTheme
+		t.Accent = accent
+		t.AccentHover = accent.Mix(colorText, 0.12)
+		t.AccentPressed = accent.Mix(colorBg, 0.16)
+		t.InactiveAccent = colorMuted
+		a.windowPalette = &t
+	}
+	return a.windowPalette
 }
 
 func svgIcon(shapes string) *ui.SVG {
@@ -76,13 +117,10 @@ func svgIcon(shapes string) *ui.SVG {
 var (
 	iconSidebar = svgIcon(`<rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M5.5 2.5v11"/>`)
 	iconRefresh = svgIcon(`<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2.5v2.8h-2.8"/>`)
-	iconPlus    = svgIcon(`<path d="M8 3.2v9.6M3.2 8h9.6"/>`)
-	iconGrid    = svgIcon(`<rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/>`)
-	iconWave    = svgIcon(`<path d="M1.5 10.5c2-5 4-5 6 0s4 5 7-3"/>`)
-	iconChain   = svgIcon(`<path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/>`)
-	iconFlow    = svgIcon(`<path d="M4.5 12.5V3.5M4.5 3.5L2 6M4.5 3.5L7 6M11.5 3.5v9M11.5 12.5L9 10M11.5 12.5L14 10"/>`)
-	iconLogs    = svgIcon(`<rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M5 6h6M5 9h4"/>`)
+	iconRemove  = lucide.X()
 )
+
+var workspaceLabels = [...]string{"工作台", "压力分布", "期权链", "资金流", "日志"}
 
 // exposureColor maps normalized [-1, +1] value to our rose <-> slate <-> mint diverging scale.
 func exposureColor(norm float64) ui.Color {
@@ -107,6 +145,7 @@ type DesktopApp struct {
 
 	// Navigation & sidebar
 	collapsed       bool
+	windowPalette   *ui.Theme
 	viewIdx         int // 0=工作台, 1=压力分布, 2=期权链, 3=资金流, 4=系统日志
 	selectedSym     string
 	newTickerTxt    string
@@ -149,11 +188,15 @@ type DesktopApp struct {
 	chainRowSel  int
 
 	// Other tables
+	heatmapRows   ui.ListState
 	boardTable    ui.ListState
 	pressureTable ui.ListState
 	unusualTable  ui.ListState
 	oiDeltaTable  ui.ListState
 	runsTable     ui.ListState
+
+	pressurePlot pressurePlot
+	intradayPlot intradayPlot
 
 	// Loaded payloads (owned by main thread via win.Update)
 	state    *viewmodel.AppStateResponse
@@ -355,6 +398,7 @@ func (a *DesktopApp) loadActiveView(sym string) {
 				})
 			}
 		}
+
 	}()
 }
 
@@ -609,139 +653,175 @@ func b2f(b bool) float32 {
 // ============================================================================
 // Main View
 // ============================================================================
-func (a *DesktopApp) view(c *ui.Context) {
-	c.SetTheme(pulseTheme())
-	vibrant := c.Vibrancy()
-	if vibrant {
-		c.Root().Background(ui.Transparent)
+func (a *DesktopApp) selectWorkspace(idx int) {
+	if idx == a.viewIdx {
+		return
 	}
+	a.viewIdx = idx
+	if idx != 0 {
+		a.intradayPlot = intradayPlot{}
+	}
+	if idx != 1 {
+		a.pressurePlot = pressurePlot{}
+	}
+	if a.selectedSym != "" {
+		a.loadActiveView(a.selectedSym)
+	}
+}
+
+func (a *DesktopApp) view(c *ui.Context) {
+	prefs := c.Preferences()
+	c.SetTheme(a.windowTheme(prefs))
+	material := c.Vibrancy() && !prefs.ReduceTransparency
+	background := colorBg
+	sidebar := colorChrome
+	if material {
+		background = ui.Transparent
+		sidebar = colorChrome.Alpha(0.62)
+	}
+	c.Root().Background(background)
 
 	bar := c.TitleBar()
+	height := max(titleBarHeight, bar.Height)
+	toggleLeft := max(10, bar.Left+6)
 	rootRow := ui.Row(c).Fill().AlignItems(ui.Stretch)
-	shown := rootRow.Animate("sidebar", b2f(!a.collapsed), 220*time.Millisecond)
-
+	shown := rootRow.Animate("sidebar", b2f(!a.collapsed), 160*time.Millisecond)
 	rootRow.Children(func() {
 		w := sidebarWidth * shown
-		ui.Row(c).Width(w).Shrink(0).AlignItems(ui.Stretch).Clip().Children(func() {
-			side := ui.Column(c).Width(sidebarWidth).Shrink(0).Margin(0, 0, 0, w-sidebarWidth)
-			if !vibrant {
-				side.Background(colorSurface)
-			}
-			side.Children(func() { a.renderSidebar(c, vibrant) })
-		})
 		if w > 0 {
+			ui.Row(c).Width(w).Shrink(0).AlignItems(ui.Stretch).Clip().Children(func() {
+				ui.Column(c).Width(sidebarWidth).Shrink(0).Margin(0, 0, 0, w-sidebarWidth).
+					Background(sidebar).Children(func() { a.renderSidebar(c, height, toggleLeft+36) })
+			})
 			ui.Box(c).Width(1).Background(colorBorder)
 		}
-		a.renderMainPane(c, 16+(1-shown)*(bar.Left+38))
+		left := float32(16)
+		if w < toggleLeft+36 {
+			left = max(left, toggleLeft+46-w)
+		}
+		width, _ := c.Size()
+		a.renderMainPane(c, height, left, width-w)
 	})
 
-	// Floating sidebar toggle button right next to macOS traffic lights
 	toggleTip := "收起侧栏"
 	if a.collapsed {
 		toggleTip = "展开侧栏"
 	}
 	toggle := ui.ButtonBase(c.Key("sidebar_toggle")).Absolute().
-		Left(bar.Left+8).Top((titleBarHeight-28)/2).Size(30, 28).
-		Radius(6).Center().TextColor(colorMuted).Label(toggleTip).Tooltip(toggleTip)
+		Left(toggleLeft).Top((height-28)/2).Size(30, 28).
+		Radius(7).Center().TextColor(colorMuted).Label(toggleTip).Tooltip(toggleTip + " · ⌥⌘S")
 	if toggle.Hovered() {
-		toggle.Background(colorHover)
+		toggle.Background(colorHover).TextColor(colorText)
 	}
-	toggle.Children(func() { ui.Icon(c, iconSidebar).Size(15, 15) })
+	toggle.Children(func() { ui.Icon(c, iconSidebar).Size(16, 16) })
 	if toggle.Clicked() {
 		a.collapsed = !a.collapsed
 	}
 }
 
-func (a *DesktopApp) renderSidebar(c *ui.Context, vibrant bool) {
-	// Drag area clearing traffic lights
-	ui.Row(c).Height(titleBarHeight).Shrink(0).AlignItems(ui.Center).
-		Padding(0, 12, 0, 112).DragWindow().Children(func() {
-		ui.Text(c, "TIDEDESK").FontSize(11).Bold().LetterSpacing(1.2).TextColor(colorMuted).SingleLine()
+func (a *DesktopApp) renderSidebar(c *ui.Context, titleHeight, titleLeft float32) {
+	ui.Row(c).Height(titleHeight).Shrink(0).AlignItems(ui.Center).
+		Padding(0, 12, 0, titleLeft).DragWindow().Children(func() {
+		ui.Text(c, "TideDesk").FontSize(13).Bold().TextColor(colorText).SingleLine()
 	})
 
-	ui.Column(c).Grow(1).Padding(6, 10, 10, 10).Gap(10).Children(func() {
+	ui.Column(c).Grow(1).Padding(4, 10, 10, 10).Gap(10).Children(func() {
 		// Add ticker row
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 			inp := ui.TextInput(c.Key("add_sym"), &a.newTickerTxt).
-				Placeholder("添加代码 如 SPY / NVDA").Grow(1).Label("添加标的")
+				Placeholder("添加标的 SPY / QQQ").Grow(1).Label("添加标的")
 			if inp.Submitted() {
 				a.triggerAddTicker()
 			}
-			btn := ui.Button(c, "").Label("加入自选").Tooltip("加入自选").
-				Disabled(strings.TrimSpace(a.newTickerTxt) == "" || a.addingTicker)
-			btn.Children(func() { ui.Icon(c, iconPlus).Size(13, 13) })
+			btn := action.Button(c, "添加", action.ButtonProps{
+				Variant: action.Primary,
+				Size:    theme.Small,
+			}).Disabled(strings.TrimSpace(a.newTickerTxt) == "" || a.addingTicker)
 			if btn.Clicked() {
 				a.triggerAddTicker()
 			}
 		})
 
 		// Watchlist cards (Pulse process-list style)
-		ui.Text(c, "自选监控").FontSize(10.5).Bold().TextColor(colorFaint).Margin(2, 4, 0, 4)
+		ui.Row(c).AlignItems(ui.Center).Padding(2, 4, 0, 4).Children(func() {
+			ui.Text(c, "自选").FontSize(11).Bold().TextColor(colorMuted)
+			ui.Spacer(c)
+			if a.state != nil && len(a.state.Tickers) > 0 {
+				ui.Textf(c, "%d 个标的", len(a.state.Tickers)).Font("monospace").FontSize(10).TextColor(colorFaint)
+			}
+		})
+
 		ui.Scroll(c.Key("watchlist_scroll")).Grow(1).Children(func() {
-			ui.Column(c).Gap(4).Children(func() {
+			ui.Column(c).Gap(5).Children(func() {
 				if a.state == nil || len(a.state.Tickers) == 0 {
-					ui.Text(c, "暂无自选标的").FontSize(12).TextColor(colorFaint).Padding(8)
+					ui.Column(c).Center().Padding(16).Gap(4).Children(func() {
+						ui.Text(c, "暂无自选标的").FontSize(12).TextColor(colorMuted)
+						ui.Text(c, "输入代码回车即可添加").FontSize(10.5).TextColor(colorFaint)
+					})
 					return
 				}
 				for _, item := range a.state.Tickers {
 					sym := item.Symbol
 					active := sym == a.selectedSym
 					row := ui.ButtonBase(c.Key("wl_"+sym)).
-						Padding(7, 9).Radius(7).AlignItems(ui.Center).Gap(6).Label(sym)
+						Padding(8, 10).Radius(8).AlignItems(ui.Center).Gap(7).Label(sym)
 					if active {
-						row.Background(ui.RGBA(110, 168, 254, 0.16)).Border(1, ui.RGBA(110, 168, 254, 0.38))
+						accent := c.Theme().Accent
+						if !c.WindowActive() {
+							accent = colorMuted
+						}
+						row.Background(accent.Alpha(0.18)).Border(1, accent.Alpha(0.32))
 					} else if row.Hovered() {
-						row.Background(ui.RGBA(255, 255, 255, 0.05))
+						row.Background(colorHover)
 					}
 					row.Children(func() {
-						// Regime indicator dot
+						// Regime indicator dot / bar
 						dotColor := colorFaint
+						tagColor := display.TagGray
 						if item.NetGEX != nil {
 							if *item.NetGEX >= 0 {
 								dotColor = colorPos
+								tagColor = display.TagGreen
 							} else {
 								dotColor = colorNeg
+								tagColor = display.TagRed
 							}
 						}
-						ui.Box(c).Size(7, 7).Radius(99).Background(dotColor).Shrink(0)
-						ui.Column(c).Grow(1).Gap(1).MinWidth(0).Children(func() {
+						ui.Box(c).Size(4, 26).Radius(2).Background(dotColor).Shrink(0)
+
+						ui.Column(c).Grow(1).Gap(2).MinWidth(0).Children(func() {
 							ui.Row(c).AlignItems(ui.Baseline).Gap(6).Children(func() {
-								ui.Text(c, sym).Font("monospace").FontSize(13).Bold().TextColor(colorText).SingleLine()
+								ui.Text(c, sym).Font("monospace").FontSize(13.5).Bold().TextColor(colorText).SingleLine()
 								if item.Spot != nil {
-									ui.Textf(c, "%.2f", *item.Spot).Font("monospace").FontFeatures("tnum").
-										FontSize(11.5).TextColor(colorSpot).SingleLine()
+									ui.Textf(c, "$%.2f", *item.Spot).Font("monospace").FontFeatures("tnum").
+										FontSize(11.5).Bold().TextColor(colorSpot).SingleLine()
 								}
 								if item.HighFreqEnabled {
-									ui.Text(c, "⚡").FontSize(10).TextColor(colorSpot)
-								}
-								if !item.LowFreqEnabled {
-									ui.Text(c, "暂停低频").FontSize(9.5).TextColor(colorFaint)
+									ui.Text(c, "⚡").FontSize(10).TextColor(colorSpot).Tooltip("高频轻量分时抓取中")
 								}
 							})
 							sub := item.StateCN
 							if item.CollectedAt != "" {
 								sub += " · " + item.CollectedAt
 							}
-							ui.Text(c, sub).FontSize(10.5).TextColor(colorMuted).SingleLine()
+							ui.Text(c, sub).FontSize(10).TextColor(colorMuted).SingleLine()
 						})
-						// Net GEX pill
-						gexColor := colorMuted
-						if item.NetGEX != nil {
-							if *item.NetGEX >= 0 {
-								gexColor = colorPos
-							} else {
-								gexColor = colorNeg
-							}
-						}
-						ui.Text(c, item.NetGEXStr).Font("monospace").FontFeatures("tnum").
-							FontSize(11.5).Bold().TextColor(gexColor).SingleLine()
 
-						del := ui.ButtonBase(c.Key("del_"+sym)).Size(18, 18).Radius(4).Center().
+						// Net GEX pill tag
+						if item.NetGEXStr != "" && item.NetGEXStr != "—" {
+							display.Tag(c, item.NetGEXStr, display.TagProps{
+								Variant: display.TagFilled,
+								Color:   tagColor,
+								Size:    theme.Small,
+							})
+						}
+
+						del := ui.ButtonBase(c.Key("del_"+sym)).Size(20, 20).Radius(4).Center().
 							TextColor(colorFaint).Label("移除 " + sym).Tooltip("从自选移除")
 						if del.Hovered() {
-							del.Background(ui.RGBA(255, 107, 107, 0.18)).TextColor(colorErr)
+							del.Background(colorNeg.Alpha(0.18)).TextColor(colorNeg)
 						}
-						del.Children(func() { ui.Text(c, "×").FontSize(12) })
+						del.Children(func() { ui.Icon(c, iconRemove).Size(11, 11) })
 						del.OnClick(func() { a.triggerRemoveTicker(sym) })
 					})
 					row.OnClick(func() {
@@ -783,12 +863,16 @@ func (a *DesktopApp) renderSidebar(c *ui.Context, vibrant bool) {
 					ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
 						lowTxt := "低频定抓: 开"
 						lowCol := colorPos
+						lowBg := colorPos.Alpha(0.12)
+						lowBorder := colorPos.Alpha(0.35)
 						if !lowEn {
 							lowTxt = "低频定抓: 关"
 							lowCol = colorMuted
+							lowBg = ui.RGBA(255, 255, 255, 0.03)
+							lowBorder = colorHair
 						}
 						bLow := ui.ButtonBase(c.Key("side_low_"+sym)).Grow(1).Padding(4, 6).Radius(5).
-							Background(colorSurface).Border(1, colorBorder).Center().TextColor(lowCol).Label(lowTxt)
+							Background(lowBg).Border(1, lowBorder).Center().TextColor(lowCol).Label(lowTxt)
 						bLow.Children(func() { ui.Text(c, lowTxt).FontSize(10.5).Bold() })
 						if bLow.Clicked() {
 							a.saveTickerCollect(sym, !lowEn, highEn, highSec, 0)
@@ -796,12 +880,16 @@ func (a *DesktopApp) renderSidebar(c *ui.Context, vibrant bool) {
 
 						highTxt := "高频实时: 关"
 						highCol := colorMuted
+						highBg := ui.RGBA(255, 255, 255, 0.03)
+						highBorder := colorHair
 						if highEn {
 							highTxt = "高频实时: 开"
 							highCol = colorSpot
+							highBg = colorSpot.Alpha(0.12)
+							highBorder = colorSpot.Alpha(0.35)
 						}
 						bHigh := ui.ButtonBase(c.Key("side_high_"+sym)).Grow(1).Padding(4, 6).Radius(5).
-							Background(colorSurface).Border(1, colorBorder).Center().TextColor(highCol).Label(highTxt)
+							Background(highBg).Border(1, highBorder).Center().TextColor(highCol).Label(highTxt)
 						bHigh.Children(func() { ui.Text(c, highTxt).FontSize(10.5).Bold() })
 						if bHigh.Clicked() {
 							a.saveTickerCollect(sym, lowEn, !highEn, highSec, 0)
@@ -863,7 +951,10 @@ func (a *DesktopApp) renderSidebar(c *ui.Context, vibrant bool) {
 					stLabel = "采集中…"
 				}
 				ui.Textf(c, "采集器 · %s", stLabel).FontSize(11).TextColor(colorMuted).Grow(1).SingleLine()
-				btnAll := ui.Button(c, "全部采集").Disabled(a.collecting)
+				btnAll := action.Button(c, "全部采集", action.ButtonProps{
+					Variant: action.Filled,
+					Size:    theme.Small,
+				}).Disabled(a.collecting)
 				if btnAll.Clicked() {
 					a.triggerCollect("")
 				}
@@ -956,60 +1047,63 @@ func (a *DesktopApp) renderSidebar(c *ui.Context, vibrant bool) {
 	})
 }
 
-func (a *DesktopApp) renderMainPane(c *ui.Context, titleLeft float32) {
+func (a *DesktopApp) renderMainPane(c *ui.Context, titleHeight, titleLeft, width float32) {
 	bar := c.TitleBar()
+	summary := a.currentTickerSummary()
 	pane := ui.Column(c).Grow(1).MinWidth(0).Background(colorBg)
 	pane.Children(func() {
-		// Unified Pulse-style header bar (draggable)
-		ui.Row(c).Height(titleBarHeight).Shrink(0).AlignItems(ui.Center).
-			Padding(0, bar.Right+14, 0, titleLeft).Gap(12).
-			BorderWidth(0, 0, 1, 0).BorderColor(colorBorder).DragWindow().Children(func() {
-			// Active symbol & quick status
+		ui.Row(c).Height(titleHeight).Shrink(0).AlignItems(ui.Center).
+			Padding(0, bar.Right+14, 0, titleLeft).Gap(10).
+			Background(colorChrome).DragWindow().Children(func() {
 			sym := a.selectedSym
 			if sym == "" {
 				sym = "TideDesk"
 			}
-			ui.Text(c, sym).Font("monospace").FontSize(16).Bold().TextColor(colorText).SingleLine()
-			if a.state != nil {
-				for _, summary := range a.state.Tickers {
-					if summary.Symbol == a.selectedSym && summary.HasData {
-						ui.Badge(c, strings.ToUpper(summary.Source)).Background(colorCard).TextColor(colorMuted)
-						ui.Text(c, summary.CollectedAt).Font("monospace").FontSize(11).TextColor(colorMuted).SingleLine()
-					}
-				}
+			ui.Text(c, sym).FontSize(17).Bold().TextColor(colorText).SingleLine()
+			if summary != nil && summary.HasData && summary.Spot != nil {
+				ui.Textf(c, "$%.2f", *summary.Spot).Font("monospace").FontFeatures("tnum").
+					FontSize(14).TextColor(colorSpot).SingleLine()
 			}
-
 			ui.Spacer(c)
-
-			// Workspace segmented switcher in the title bar
-			prevView := a.viewIdx
-			if ui.Segmented(c.Key("main_nav"), &a.viewIdx, "▦ 工作台", "▤ 压力分布", "☰ 期权链", "⇅ 资金流", "▤ 日志").
-				Label("工作区").Changed() && a.viewIdx != prevView && a.selectedSym != "" {
-				a.loadActiveView(a.selectedSym)
+			if a.collecting {
+				ui.Spinner(c).Size(13, 13)
 			}
-
-			ui.Spacer(c)
-
-			// Right action cluster
-			if ui.Button(c, "刷新").Tooltip("手动刷新本地数据，不访问行情源").Clicked() {
+			refresh := ui.ButtonBase(c.Key("toolbar_refresh")).Size(30, 28).Radius(7).
+				Center().TextColor(colorMuted).Label("刷新").Tooltip("刷新本地数据 · ⌘R")
+			if refresh.Hovered() {
+				refresh.Background(colorHover).TextColor(colorText)
+			}
+			refresh.Children(func() { ui.Icon(c, iconRefresh).Size(15, 15) })
+			if refresh.Clicked() {
 				a.refreshAll()
 			}
 			if a.selectedSym != "" {
-				btn := ui.Button(c, "").Label("立即采集当前标的").Tooltip("立即采集 " + a.selectedSym).Disabled(a.collecting)
-				btn.Children(func() {
-					ui.Icon(c, iconRefresh).Size(13, 13)
-					ui.Text(c, "采集").FontSize(12)
-				})
+				btn := action.Button(c, "采集", action.ButtonProps{Variant: action.Primary, Size: theme.Small}).
+					Tooltip("立即采集 " + a.selectedSym + " 期权全链").Disabled(a.collecting)
 				if btn.Clicked() {
 					a.triggerCollect(a.selectedSym)
+				}
+			}
+		})
+		ui.Row(c).Height(39).Shrink(0).AlignItems(ui.Center).Padding(0, 14).Gap(8).
+			Background(colorChrome).BorderWidth(0, 0, 1, 0).BorderColor(colorBorder).Children(func() {
+			selected := a.viewIdx
+			if ui.Segmented(c.Key("main_nav"), &selected, workspaceLabels[:]...).Label("工作区").Changed() {
+				a.selectWorkspace(selected)
+			}
+			ui.Spacer(c)
+			if summary != nil && summary.HasData {
+				ui.Text(c, strings.ToUpper(summary.Source)).FontSize(10).Bold().TextColor(colorMuted).SingleLine()
+				if summary.CollectedAt != "" {
+					ui.Text(c, summary.CollectedAt).Font("monospace").FontSize(10.5).TextColor(colorMuted).SingleLine()
 				}
 			}
 		})
 
 		// Body
 		if a.selectedSym == "" {
-			ui.Column(c).Grow(1).Center().Gap(8).Children(func() {
-				ui.Text(c, "从左侧边栏添加或选择标的开始看盘").FontSize(14).Bold()
+			ui.Column(c).Grow(1).Center().Gap(10).Children(func() {
+				ui.Text(c, "从左侧边栏添加或选择标的开始看盘").FontSize(14).Bold().TextColor(colorText)
 				ui.Text(c, "支持美股期权全链 Cboe 优先抓取与本地 SQLite 快照回放").FontSize(12).TextColor(colorMuted)
 			})
 			return
@@ -1017,19 +1111,14 @@ func (a *DesktopApp) renderMainPane(c *ui.Context, titleLeft float32) {
 
 		// Every tab shares a cached summary, not a complete matrix request.
 		var ribbon *viewmodel.RibbonData
-		if a.state != nil {
-			for _, summary := range a.state.Tickers {
-				if summary.Symbol == a.selectedSym {
-					ribbon = summary.Ribbon
-					break
-				}
-			}
+		if summary != nil {
+			ribbon = summary.Ribbon
 		}
 		if (a.viewIdx == 0 || a.viewIdx == 1) && a.wb != nil && !a.wb.Empty && a.wb.Ticker == a.selectedSym {
 			ribbon = &a.wb.Ribbon
 		}
 		if ribbon != nil {
-			a.renderRibbon(c, ribbon)
+			a.renderRibbon(c, ribbon, width)
 		}
 
 		switch a.viewIdx {
@@ -1047,46 +1136,69 @@ func (a *DesktopApp) renderMainPane(c *ui.Context, titleLeft float32) {
 	})
 }
 
-func (a *DesktopApp) renderRibbon(c *ui.Context, r *viewmodel.RibbonData) {
-	ui.Row(c).Padding(8, 14, 4, 14).Gap(6).AlignItems(ui.Stretch).Children(func() {
-		// Regime card
+func (a *DesktopApp) renderRibbon(c *ui.Context, r *viewmodel.RibbonData, width float32) {
+	hero := func() {
 		accent := colorNeg
 		badge := "−γ 放大"
+		tagColor := display.TagRed
 		if r.Positive {
 			accent = colorPos
 			badge = "+γ 压制"
+			tagColor = display.TagGreen
 		}
-		ui.Column(c).Width(234).Shrink(0).Padding(7, 11).Radius(8).
-			Background(colorSurface).Border(1, accent.Alpha(0.42)).Gap(2).
+		ui.Column(c).Width(230).Shrink(0).Padding(7, 12).Radius(8).
+			Background(colorSurface).Border(1, accent.Alpha(0.48)).Gap(2).
 			Tooltip(r.StateSub).Children(func() {
 			ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
-				ui.Text(c, r.StateCN).FontSize(13).Bold().TextColor(colorText).SingleLine()
+				ui.Text(c, r.StateCN).FontSize(13.5).Bold().TextColor(colorText).SingleLine()
 				ui.Spacer(c)
-				ui.Badge(c, badge).Background(accent.Mix(colorBg, 0.8)).TextColor(accent)
+				display.Tag(c, badge, display.TagProps{
+					Variant: display.TagFilled,
+					Color:   tagColor,
+					Size:    theme.Small,
+				})
 			})
 			ui.Text(c, r.Scope).Font("monospace").FontSize(10).TextColor(colorMuted).SingleLine()
 		})
+	}
 
-		tile := func(title, val, sub string, valColor ui.Color) {
-			ui.Column(c).Grow(1).Basis(0).MinWidth(82).Padding(7, 10).Radius(8).
-				Background(colorSurface).Border(1, colorBorder).Gap(2).Children(func() {
-				ui.Text(c, title).FontSize(10).Bold().TextColor(colorFaint).SingleLine()
-				ui.Text(c, val).Font("monospace").FontFeatures("tnum").FontSize(14.5).Bold().TextColor(valColor).SingleLine()
-				ui.Text(c, sub).Font("monospace").FontFeatures("tnum").FontSize(10).TextColor(colorMuted).SingleLine()
+	gexColor := colorNeg
+	if r.Positive {
+		gexColor = colorPos
+	}
+	tiles := [...]struct {
+		title, value, detail string
+		color                ui.Color
+	}{
+		{"现价 SPOT", r.SpotStr, a.selectedSym, colorSpot},
+		{"净 GEX", r.NetGEXStr, "USD / 1%", gexColor},
+		{"GAMMA 翻转", r.GammaFlipStr, r.FlipDistStr, colorFlip},
+		{"CALL 墙", r.CallGEXWall, "OI " + r.CallOIWall, colorPos},
+		{"PUT 墙", r.PutGEXWall, "OI " + r.PutOIWall, colorNeg},
+		{"MAX PAIN", r.MaxPain, r.MaxPainExp, colorVol},
+		{"±1σ 预期", r.MoveStr, r.MovePctStr, colorSpot},
+		{"ATM IV / P·C", r.ATMIVStr, "P/C " + r.PCROIStr, colorText},
+	}
+	drawTiles := func(start, end int) {
+		for _, tile := range tiles[start:end] {
+			ui.Column(c).Grow(1).Basis(0).MinWidth(80).Padding(6, 9).Radius(8).
+				Background(colorSurface).Border(1, colorBorder).Gap(1).Children(func() {
+				ui.Text(c, tile.title).FontSize(9.5).Bold().LetterSpacing(0.6).TextColor(colorMuted).SingleLine()
+				ui.Text(c, tile.value).Font("monospace").FontFeatures("tnum").FontSize(15).Bold().TextColor(tile.color).SingleLine()
+				ui.Text(c, tile.detail).Font("monospace").FontFeatures("tnum").FontSize(9.5).TextColor(colorMuted).SingleLine()
 			})
 		}
-
-		gexCol := colorNeg
-		if r.Positive {
-			gexCol = colorPos
+	}
+	ui.Row(c).Padding(6, 14, 2, 14).Gap(6).AlignItems(ui.Stretch).Children(func() {
+		hero()
+		// Leave room for all eight tiles at the minimum window width.
+		if width >= 980 {
+			drawTiles(0, len(tiles))
+			return
 		}
-		tile("现价 SPOT", r.SpotStr, a.selectedSym, colorSpot)
-		tile("净 GEX", r.NetGEXStr, "USD / 1%", gexCol)
-		tile("GAMMA 翻转", r.GammaFlipStr, r.FlipDistStr, colorFlip)
-		tile("CALL 墙", r.CallGEXWall, "OI "+r.CallOIWall, colorPos)
-		tile("PUT 墙", r.PutGEXWall, "OI "+r.PutOIWall, colorNeg)
-		tile("MAX PAIN", r.MaxPain, r.MaxPainExp, colorVol)
-		tile("±1σ 预期", r.MoveStr, r.MovePctStr, colorSpot)
-		tile("ATM IV / P·C", r.ATMIVStr, "P/C "+r.PCROIStr, colorText)
+		ui.Column(c).Grow(1).MinWidth(0).Gap(6).Children(func() {
+			ui.Row(c).Gap(6).Children(func() { drawTiles(0, 4) })
+			ui.Row(c).Gap(6).Children(func() { drawTiles(4, len(tiles)) })
+		})
 	})
 }

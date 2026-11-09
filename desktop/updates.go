@@ -3,6 +3,7 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
+	"strconv"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -36,11 +37,29 @@ func configureUpdates() {
 }
 
 func configureUpdateMenu(app *DesktopApp) {
+	viewMenu := []*mygo.MenuItem{
+		{Label: "刷新本地数据", Accelerator: "CmdOrCtrl+R", Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
+			app.refreshAll()
+		}},
+		{Label: "显示或隐藏侧栏", Accelerator: "CmdOrCtrl+Alt+S", Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
+			app.update(func() { app.collapsed = !app.collapsed })
+		}},
+		mygo.Separator(),
+	}
+	for i, title := range workspaceLabels {
+		viewMenu = append(viewMenu, &mygo.MenuItem{
+			Label: title, Accelerator: "CmdOrCtrl+" + strconv.Itoa(i+1),
+			Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
+				app.update(func() { app.selectWorkspace(i) })
+			},
+		})
+	}
+
 	mygo.App.SetMenu(mygo.NewMenu([]*mygo.MenuItem{
 		{Label: "TideDesk", Submenu: []*mygo.MenuItem{
 			{Role: mygo.RoleAbout}, updater.MenuItem(), mygo.Separator(), {Role: mygo.RoleQuit},
 		}},
-		{Role: mygo.RoleEditMenu}, {Role: mygo.RoleWindowMenu},
+		{Role: mygo.RoleEditMenu}, {Label: "显示", Submenu: viewMenu}, {Role: mygo.RoleWindowMenu},
 	}))
 	off := updater.OnChange(func() { app.update(func() {}) })
 	mygo.App.OnQuit(off)

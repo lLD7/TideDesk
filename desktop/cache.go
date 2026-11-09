@@ -8,7 +8,8 @@ import (
 	"time"
 )
 
-const cacheBudget = 32 << 20
+const cacheBudget = 12 << 20
+const maxCacheEntries = 16
 
 type cachedResponse struct {
 	value any
@@ -124,7 +125,7 @@ func (c *responseCache) compute(key string, p *pendingResponse, fn func(context.
 	if c.pending[key] == p {
 		delete(c.pending, key)
 		if err == nil && size <= cacheBudget {
-			for len(c.values) >= 64 || c.bytes+size > cacheBudget {
+			for len(c.values) >= maxCacheEntries || c.bytes+size > cacheBudget {
 				var oldest string
 				var when time.Time
 				for k, v := range c.values {
@@ -143,7 +144,7 @@ func (c *responseCache) compute(key string, p *pendingResponse, fn func(context.
 }
 
 // Cached view values are acyclic. Count backing storage without encoding it.
-// Shared references may be counted twice, which errs toward earlier eviction.
+// Fast bounded sampling prevents deep reflection explosions on large slices.
 func retainedBytes(v reflect.Value) int {
 	switch v.Kind() {
 	case reflect.String:
@@ -158,8 +159,17 @@ func retainedBytes(v reflect.Value) int {
 		size := v.Cap() * int(elem.Size())
 		switch elem.Kind() {
 		case reflect.String, reflect.Pointer, reflect.Slice, reflect.Struct:
-			for i := 0; i < v.Len(); i++ {
-				size += retainedBytes(v.Index(i))
+			n := v.Len()
+			if n == 0 {
+				return size
+			}
+			samples := min(8, n)
+			sampleExtra := 0
+			for i := 0; i < samples; i++ {
+				sampleExtra += retainedBytes(v.Index(i))
+			}
+			if samples > 0 {
+				size += (sampleExtra * n) / samples
 			}
 		}
 		return size

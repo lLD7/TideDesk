@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
+	"unsafe"
 
 	"gammagrid.local/desktop/internal/marketclock"
 	"gammagrid.local/desktop/internal/provider"
@@ -591,16 +591,31 @@ func (s *DesktopService) loadOrSynthesizeTimeBars(ctx context.Context, ticker, s
 		return dbBars
 	}
 
-	// Fallback: derive time bars from historical snapshots in option_snapshots (up to last 16 snapshots).
+	// Fallback: derive time bars from historical snapshots in option_snapshots (bounded to target day).
 	moments, err := s.store.CollectionMoments(ctx, tkr, source, 14, false)
 	if err == nil && len(moments) > 0 {
-		if len(moments) > 16 {
-			moments = moments[:16]
+		var todayMoments []string
+		for _, m := range moments {
+			if marketclock.MarketDay(m) == tradingDay {
+				todayMoments = append(todayMoments, m)
+			}
+		}
+		if len(todayMoments) == 0 {
+			// Fallback: use moments from the latest available day
+			latestDay := marketclock.MarketDay(moments[0])
+			for _, m := range moments {
+				if marketclock.MarketDay(m) == latestDay {
+					todayMoments = append(todayMoments, m)
+				}
+			}
+		}
+		if len(todayMoments) > 8 {
+			todayMoments = todayMoments[:8]
 		}
 		// Reverse to chronological order (oldest -> newest).
-		chron := make([]string, len(moments))
-		for i := range moments {
-			chron[i] = moments[len(moments)-1-i]
+		chron := make([]string, len(todayMoments))
+		for i := range todayMoments {
+			chron[i] = todayMoments[len(todayMoments)-1-i]
 		}
 		var synth []viewmodel.IntradayBar
 		var prevDay string
@@ -612,9 +627,6 @@ func (s *DesktopService) loadOrSynthesizeTimeBars(ctx context.Context, ticker, s
 			mRows, err := s.store.SnapshotsAt(ctx, tkr, source, []string{m})
 			if err != nil || len(mRows) == 0 {
 				continue
-			}
-			if solveSnapshotIV(ctx, mRows) != nil {
-				return nil
 			}
 			day := marketclock.MarketDay(m)
 			wSet, _ := weeklyExpirySetFromRows(mRows, m)
@@ -843,13 +855,15 @@ func (s *DesktopService) markSampled(ticker string, now time.Time) {
 	delete(s.highFreqRetry, ticker)
 }
 
+const liveBudget = 8 << 20
+
 func (s *DesktopService) publishLive(ticker string, rows []store.StoredOptionRow) {
 	size := liveSnapshotBytes(rows)
 	s.intradayMu.Lock()
 	defer s.intradayMu.Unlock()
 	s.dropLive(ticker)
-	// Keep live market data within a separate budget from cached page results.
-	for size <= cacheBudget && s.liveBytes+size > cacheBudget {
+	// Keep live market data within an 8MB budget.
+	for size <= liveBudget && s.liveBytes+size > liveBudget {
 		var oldest string
 		for symbol, candidate := range s.liveSnapshots {
 			if oldest == "" || candidate[0].CollectedAt < s.liveSnapshots[oldest][0].CollectedAt {
@@ -858,7 +872,7 @@ func (s *DesktopService) publishLive(ticker string, rows []store.StoredOptionRow
 		}
 		s.dropLive(oldest)
 	}
-	if size <= cacheBudget {
+	if size <= liveBudget {
 		s.liveSnapshots[ticker] = rows
 		s.liveSizes[ticker] = size
 		s.liveBytes += size
@@ -866,7 +880,12 @@ func (s *DesktopService) publishLive(ticker string, rows []store.StoredOptionRow
 }
 
 func liveSnapshotBytes(rows []store.StoredOptionRow) int {
-	return int(reflect.TypeOf(rows).Size()) + retainedBytes(reflect.ValueOf(rows))
+	if len(rows) == 0 {
+		return 0
+	}
+	// Direct O(1) estimation: base StoredOptionRow struct + pointer values (~80 bytes/row)
+	const rowEstimatedSize = int(unsafe.Sizeof(store.StoredOptionRow{})) + 80
+	return cap(rows) * rowEstimatedSize
 }
 
 // dropLive is called with intradayMu held.

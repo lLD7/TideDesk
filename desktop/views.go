@@ -8,17 +8,25 @@ import (
 	"gammagrid.local/desktop/internal/viewmodel"
 
 	"github.com/egoist/mygo/ui"
+	"github.com/lobehub/lobe-mygo/pkg/action"
+	"github.com/lobehub/lobe-mygo/pkg/display"
+	"github.com/lobehub/lobe-mygo/pkg/theme"
 )
 
 func sectionCard(c *ui.Context, title, badge string, body func()) ui.Element {
-	card := ui.Column(c).Padding(10, 12).Gap(8).Radius(8).
+	card := ui.Column(c).Padding(8, 12).Gap(8).Radius(8).
 		Background(colorSurface).Border(1, colorBorder)
 	card.Children(func() {
-		ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
-			ui.Text(c, title).FontSize(12).Bold().TextColor(colorText).SingleLine()
+		ui.Row(c).Padding(0, 0, 6, 0).AlignItems(ui.Center).Gap(8).
+			BorderWidth(0, 0, 1, 0).BorderColor(colorHair).Children(func() {
+			ui.Text(c, title).FontSize(12.5).Bold().TextColor(colorText).SingleLine()
 			ui.Spacer(c)
 			if badge != "" {
-				ui.Badge(c, badge).Background(colorCard).TextColor(colorMuted)
+				display.Tag(c, badge, display.TagProps{
+					Variant: display.TagFilled,
+					Color:   display.TagGray,
+					Size:    theme.Small,
+				})
 			}
 		})
 		body()
@@ -133,7 +141,11 @@ func (a *DesktopApp) renderExposureMatrixCard(c *ui.Context, wb *viewmodel.Workb
 		ui.Row(c).AlignItems(ui.Center).Gap(8).Wrap().Children(func() {
 			ui.Text(c, "缩写 GEX / 敞口热力矩阵").FontSize(12).Bold().TextColor(colorText).SingleLine()
 			badge := fmt.Sprintf("%s · %s · %d 到期 × %d 行权价 · Σ %s", wb.DimensionCN, wb.UnitCN, len(wb.Expiries), len(wb.Strikes), wb.GrandTotalStr)
-			ui.Badge(c, badge).Background(colorCard).TextColor(colorMuted)
+			display.Tag(c, badge, display.TagProps{
+				Variant: display.TagFilled,
+				Color:   display.TagGray,
+				Size:    theme.Small,
+			})
 
 			ui.Spacer(c)
 
@@ -144,9 +156,11 @@ func (a *DesktopApp) renderExposureMatrixCard(c *ui.Context, wb *viewmodel.Workb
 				ui.Text(c, "✕Pain 痛点").Font("monospace").FontSize(10).TextColor(colorVol)
 			})
 
-			if ui.Button(c, "▤ 行权价累计压力 ➔").Tooltip("切换到独立的行权价累计压力分布视图").Clicked() {
-				a.viewIdx = 1
-				a.loadActiveView(a.selectedSym)
+			if action.Button(c, "▤ 行权价累计压力 ➔", action.ButtonProps{
+				Variant: action.Filled,
+				Size:    theme.Small,
+			}).Tooltip("切换到独立的行权价累计压力分布视图").Clicked() {
+				a.selectWorkspace(1)
 			}
 		})
 
@@ -209,86 +223,83 @@ func (a *DesktopApp) renderExposureMatrixCard(c *ui.Context, wb *viewmodel.Workb
 			}
 		})
 
-		// Compact scrollable matrix rows (capped at 310px height so charts below are immediately visible)
-		ui.Scroll(c.Key("wb_compact_matrix_scroll")).MaxHeight(310).Children(func() {
-			ui.Column(c).Gap(1).Children(func() {
-				for rIdx := 0; rIdx < nRows; rIdx++ {
-					strikeVal := wb.Strikes[rIdx]
-					strikeLbl := wb.StrikeLabels[rIdx]
-					strikeTag := ""
-					if rIdx < len(wb.StrikeTags) {
-						strikeTag = wb.StrikeTags[rIdx]
-					}
-					isATM := wb.ATMStrike != nil && math.Abs(strikeVal-*wb.ATMStrike) < 1e-4
+		// The headings stay pinned while MyGo builds only visible body rows.
+		height := min(360, float32(nRows)*rowH)
+		ui.List(c.Key("wb_heatmap_rows"), &a.heatmapRows, nRows, func(rIdx int) {
+			strikeVal := wb.Strikes[rIdx]
+			strikeLbl := wb.StrikeLabels[rIdx]
+			strikeTag := ""
+			if rIdx < len(wb.StrikeTags) {
+				strikeTag = wb.StrikeTags[rIdx]
+			}
+			isATM := wb.ATMStrike != nil && math.Abs(strikeVal-*wb.ATMStrike) < 1e-4
 
-					rowEl := ui.Row(c).Height(rowH).AlignItems(ui.Stretch)
+			rowEl := ui.Row(c).Height(rowH).AlignItems(ui.Stretch)
+			if isATM {
+				rowEl.Border(1, colorSpot).Radius(3)
+			}
+			rowEl.Children(func() {
+				strikeBg := ui.RGB(14, 19, 27)
+				strikeCol := colorText
+				if isATM {
+					strikeBg = ui.RGBA(255, 181, 71, 0.16)
+					strikeCol = colorSpot
+				}
+				ui.Row(c).Width(strikeColW).Shrink(0).Padding(0, 6).AlignItems(ui.Center).
+					Background(strikeBg).Gap(3).Children(func() {
+					prefix := " "
 					if isATM {
-						rowEl.Border(1, colorSpot).Radius(3)
+						prefix = "▸"
 					}
-					rowEl.Children(func() {
-						strikeBg := ui.RGB(14, 19, 27)
-						strikeCol := colorText
-						if isATM {
-							strikeBg = ui.RGBA(255, 181, 71, 0.16)
-							strikeCol = colorSpot
+					ui.Text(c, prefix+strikeLbl).Font("monospace").FontFeatures("tnum").
+						FontSize(10.5).Bold().TextColor(strikeCol).SingleLine()
+					ui.Spacer(c)
+					if strikeTag != "" {
+						tagCol := colorFlip
+						if strings.Contains(strikeTag, "◆C") || strings.Contains(strikeTag, "▲OI") {
+							tagCol = colorPos
+						} else if strings.Contains(strikeTag, "◆P") || strings.Contains(strikeTag, "▼OI") {
+							tagCol = colorNeg
+						} else if strings.Contains(strikeTag, "✕Pain") {
+							tagCol = colorVol
 						}
-						ui.Row(c).Width(strikeColW).Shrink(0).Padding(0, 6).AlignItems(ui.Center).
-							Background(strikeBg).Gap(3).Children(func() {
-							prefix := " "
-							if isATM {
-								prefix = "▸"
-							}
-							ui.Text(c, prefix+strikeLbl).Font("monospace").FontFeatures("tnum").
-								FontSize(10.5).Bold().TextColor(strikeCol).SingleLine()
-							ui.Spacer(c)
-							if strikeTag != "" {
-								tagCol := colorFlip
-								if strings.Contains(strikeTag, "◆C") || strings.Contains(strikeTag, "▲OI") {
-									tagCol = colorPos
-								} else if strings.Contains(strikeTag, "◆P") || strings.Contains(strikeTag, "▼OI") {
-									tagCol = colorNeg
-								} else if strings.Contains(strikeTag, "✕Pain") {
-									tagCol = colorVol
-								}
-								ui.Text(c, strikeTag).Font("monospace").FontSize(9).Bold().TextColor(tagCol).SingleLine()
-							}
-						})
+						ui.Text(c, strikeTag).Font("monospace").FontSize(9).Bold().TextColor(tagCol).SingleLine()
+					}
+				})
 
-						for cIdx := 0; cIdx < nCols; cIdx++ {
-							txt := ""
-							norm := 0.0
-							tip := ""
-							if rIdx < len(wb.CellsText) && cIdx < len(wb.CellsText[rIdx]) {
-								txt = wb.CellsText[rIdx][cIdx]
-							}
-							if rIdx < len(wb.CellsNorm) && cIdx < len(wb.CellsNorm[rIdx]) {
-								norm = wb.CellsNorm[rIdx][cIdx]
-							}
-							if rIdx < len(wb.CellsTip) && cIdx < len(wb.CellsTip[rIdx]) {
-								tip = wb.CellsTip[rIdx][cIdx]
-							}
-							bg := exposureColor(norm)
-							fg := colorText
-							if math.Abs(norm) < 0.08 {
-								fg = colorMuted
-							} else if math.Abs(norm) > 0.65 {
-								fg = ui.RGB(250, 252, 255)
-							}
-							cell := ui.Row(c).Grow(1).Basis(0).MinWidth(52).Center().
-								Background(bg).BorderWidth(0, 0, 0, 1).BorderColor(colorHair)
-							if tip != "" {
-								cell.Tooltip(tip)
-							}
-							cell.Children(func() {
-								if txt != "" {
-									ui.Text(c, txt).Font("monospace").FontFeatures("tnum").FontSize(10).TextColor(fg).SingleLine()
-								}
-							})
+				for cIdx := 0; cIdx < nCols; cIdx++ {
+					txt := ""
+					norm := 0.0
+					tip := ""
+					if rIdx < len(wb.CellsText) && cIdx < len(wb.CellsText[rIdx]) {
+						txt = wb.CellsText[rIdx][cIdx]
+					}
+					if rIdx < len(wb.CellsNorm) && cIdx < len(wb.CellsNorm[rIdx]) {
+						norm = wb.CellsNorm[rIdx][cIdx]
+					}
+					if rIdx < len(wb.CellsTip) && cIdx < len(wb.CellsTip[rIdx]) {
+						tip = wb.CellsTip[rIdx][cIdx]
+					}
+					bg := exposureColor(norm)
+					fg := colorText
+					if math.Abs(norm) < 0.08 {
+						fg = colorMuted
+					} else if math.Abs(norm) > 0.65 {
+						fg = ui.RGB(250, 252, 255)
+					}
+					cell := ui.Row(c).Grow(1).Basis(0).MinWidth(52).Center().
+						Background(bg).BorderWidth(0, 0, 0, 1).BorderColor(colorHair)
+					if tip != "" {
+						cell.Tooltip(tip)
+					}
+					cell.Children(func() {
+						if txt != "" {
+							ui.Text(c, txt).Font("monospace").FontFeatures("tnum").FontSize(10).TextColor(fg).SingleLine()
 						}
 					})
 				}
 			})
-		})
+		}).Height(height).FillWidth()
 	})
 }
 
@@ -1122,7 +1133,10 @@ func (a *DesktopApp) renderLogsView(c *ui.Context) {
 			ui.Row(c).Gap(16).Wrap().Children(func() {
 				ui.Textf(c, "采集器状态: %s", st.CollectorState).Font("monospace").FontSize(12)
 				ui.Text(c, "下次采集: "+st.NextCollection).Font("monospace").FontSize(12).TextColor(colorMuted)
-				if ui.Button(c, "备份数据库").Disabled(a.collecting).Clicked() {
+				if action.Button(c, "备份数据库", action.ButtonProps{
+					Variant: action.Filled,
+					Size:    theme.Small,
+				}).Disabled(a.collecting).Clicked() {
 					a.statusMsg = "正在备份数据库…"
 					go func() {
 						path, err := a.service.backup(a.service.ctx)

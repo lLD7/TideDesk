@@ -220,7 +220,7 @@ func sampleDesktopApp() *DesktopApp {
 func TestDesktopAppViewsRenderCleanly(t *testing.T) {
 	app := sampleDesktopApp()
 	tt := ui.NewTester(app.view, 1520, 1080)
-	if !tt.HasText("TIDEDESK") || !tt.HasText("SPY") {
+	if !tt.HasText("TideDesk") || !tt.HasText("SPY") {
 		t.Fatalf("expected header texts, got %v", tt.Texts())
 	}
 	if !tt.HasText("Weekly DTE 资金潮汐") || !tt.HasText("波动率曲面与期限结构 · Volatility") {
@@ -260,5 +260,23 @@ func TestDesktopAppViewsRenderCleanly(t *testing.T) {
 			tt.Frame()
 		}
 		saveSnap(name)
+	}
+	// Use the minimum window size and system settings that disable animation.
+	app.viewIdx = 0
+	tt = ui.NewTester(app.view, 1080, 680)
+	tt.SetPreferences(ui.Preferences{Accent: ui.RGB(10, 132, 255), ReduceMotion: true, ReduceTransparency: true})
+	saveSnap("06_compact_workbench")
+	if err := tt.Click("收起侧栏"); err != nil {
+		t.Fatal(err)
+	}
+	if tt.HasText("自选") || !tt.HasText("工作区") {
+		t.Fatal("collapsed sidebar should leave the workspace visible")
+	}
+	saveSnap("07_collapsed_sidebar")
+	if err := tt.Click("展开侧栏"); err != nil {
+		t.Fatal(err)
+	}
+	if !tt.HasText("自选") {
+		t.Fatal("sidebar did not return")
 	}
 }

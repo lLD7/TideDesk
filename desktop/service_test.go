@@ -110,7 +110,11 @@ func TestStoreAtomicOwnershipArchiveBackup(t *testing.T) {
 }
 func TestScheduleDSTHolidayAndTemporaryExpiry(t *testing.T) {
 	cfg := marketclock.DefaultSchedule()
-	sessions := map[string]marketclock.SessionHours{"2026-03-06": {"09:30", "16:00"}, "2026-03-09": {"09:30", "16:00"}, "2026-11-27": {"09:30", "13:00"}}
+	sessions := map[string]marketclock.SessionHours{
+		"2026-03-06": {Open: "09:30", Close: "16:00"},
+		"2026-03-09": {Open: "09:30", Close: "16:00"},
+		"2026-11-27": {Open: "09:30", Close: "13:00"},
+	}
 	for _, utc := range []string{"2026-03-06T15:00:00Z", "2026-03-09T14:00:00Z"} {
 		now, _ := time.Parse(time.RFC3339, utc)
 		key, ok := marketclock.DueSlot(now, cfg, sessions)

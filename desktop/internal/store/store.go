@@ -51,7 +51,7 @@ func Open(root, path string) (s *Store, err error) {
 		}
 	}(s)
 	uri := (&url.URL{Scheme: "file", Path: path}).String()
-	s.write, err = sql.Open("sqlite3", uri+"?_busy_timeout=10000&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on")
+	s.write, err = sql.Open("sqlite3", uri+"?_busy_timeout=10000&_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_cache_size=-2000")
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +60,7 @@ func Open(root, path string) (s *Store, err error) {
 	if err = s.migrate(root); err != nil {
 		return nil, err
 	}
-	s.read, err = sql.Open("sqlite3", uri+"?mode=ro&_busy_timeout=10000&_query_only=on")
+	s.read, err = sql.Open("sqlite3", uri+"?mode=ro&_busy_timeout=10000&_query_only=on&_cache_size=-2000")
 	if err != nil {
 		return nil, err
 	}
